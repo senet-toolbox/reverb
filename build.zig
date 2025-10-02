@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const loom_mod = loom.module("loom");
+    // mod.addImport("loom", loom_mod);
 
     // // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{

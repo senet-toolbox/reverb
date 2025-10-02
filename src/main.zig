@@ -8,22 +8,7 @@ const Loom = loompkg.Loom;
 const Client = loompkg.Client;
 const Server = @import("lib/server.zig");
 const Context = @import("lib/context.zig");
-// const Loom = @import("lib/engine/Loom.zig");
-// const Scheduler = @import("lib/engine/async/Scheduler.zig");
-// const createFiber = Scheduler.createFiber;
-// const activate = Scheduler.activate;
-// const xresume = Scheduler.xresume;
-// const xsuspend = Scheduler.xsuspend;
-//
-// const Next = Server.Next;
-// var loom: Loom = undefined;
-//
-// fn fiber_response(ctx: *Context) !void {
-//     try ctx.STRING("SUCCESS");
-//     // Suspends this fiber and resumes the calling fiber
-//     // xsuspend();
-// }
-//
+
 fn ping(ctx: *Context) !void {
     try ctx.STRING("SUCCESS");
 }
