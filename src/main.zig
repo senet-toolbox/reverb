@@ -3,31 +3,37 @@
 //! is to delete this file and start with root.zig instead.
 
 const std = @import("std");
+const loompkg = @import("loom");
+const Loom = loompkg.Loom;
+const Client = loompkg.Client;
 const Server = @import("lib/server.zig");
 const Context = @import("lib/context.zig");
-const Loom = @import("lib/engine/Loom.zig");
-const Scheduler = @import("lib/engine/async/Scheduler.zig");
-const createFiber = Scheduler.createFiber;
-const activate = Scheduler.activate;
-const xresume = Scheduler.xresume;
-const xsuspend = Scheduler.xsuspend;
-
-const Next = Server.Next;
-var loom: Loom = undefined;
-
-fn fiber_response(ctx: *Context) !void {
+// const Loom = @import("lib/engine/Loom.zig");
+// const Scheduler = @import("lib/engine/async/Scheduler.zig");
+// const createFiber = Scheduler.createFiber;
+// const activate = Scheduler.activate;
+// const xresume = Scheduler.xresume;
+// const xsuspend = Scheduler.xsuspend;
+//
+// const Next = Server.Next;
+// var loom: Loom = undefined;
+//
+// fn fiber_response(ctx: *Context) !void {
+//     try ctx.STRING("SUCCESS");
+//     // Suspends this fiber and resumes the calling fiber
+//     // xsuspend();
+// }
+//
+fn ping(ctx: *Context) !void {
     try ctx.STRING("SUCCESS");
-    // Suspends this fiber and resumes the calling fiber
-    // xsuspend();
 }
 
-fn ping(ctx: *Context) !void {
-    // const stack = try loom.scheduler.stackAlloc(null);
-    // defer loom.scheduler.freeStack(stack);
-    // const fiber = try createFiber(fiber_response, .{ctx}, stack);
-    try ctx.STRING("SUCCESS");
-    // We start the fiber
-    // activate(fiber);
+const resp = "HTTP/1.1 200 OK\r\nDate: Tue, 19 Aug 2025 18:37:36 GMT\r\nContent-Length: 7\r\nContent-Type: text/plain charset=utf-8\r\n\r\nSUCCESS";
+fn handle(client: *Client, _: []const u8) !void {
+    try client.fillWriteBuffer(resp);
+    _ = client.writeMessage() catch |err| {
+        std.debug.print("Client Write Error: {any}\n", .{err});
+    };
 }
 
 pub fn main() !void {
@@ -42,8 +48,5 @@ pub fn main() !void {
 
     try server.new(loom_config, &allocator, null);
     try server.get("/ping", ping, &.{});
-
-    loom = Server.instance.loom;
-
     try server.listen();
 }

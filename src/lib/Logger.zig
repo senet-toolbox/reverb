@@ -38,27 +38,32 @@ fn log(
 ) !void {
     const debug_info = try std.debug.getSelfDebugInfo();
     var buf: [512]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const writer = stream.writer();
-    const tty = std.io.tty.detectConfig(std.io.getStdErr());
+    var stream = std.Io.Writer.fixed(&buf);
+    const writer = &stream;
+    const tty = std.io.tty.detectConfig(std.fs.File.stderr());
     try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
     // 4) Grab only the bytes that were written
-    const outSlice = buf[0..stream.pos];
+    const outSlice = buf[0..stream.end];
     const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
-    const src = buf[start..stream.pos];
+    const src = buf[start..stream.end];
     var sections = std.mem.splitScalar(u8, src, ':');
     const file_name = sections.next() orelse return;
     const line = sections.next() orelse return;
     logger.mutex.lock();
     defer logger.mutex.unlock();
-    const stderr = std.io.getStdErr().writer();
-    nosuspend stderr.print("[{d}] ", .{std.time.timestamp()}) catch return;
-    nosuspend stderr.print("[{s}{s}\x1b[0m] ", .{ log_level.color(), @tagName(log_level) }) catch return;
+    // const stderr = std.io.getStdErr().writer();
+    var errstream = std.Io.Writer.fixed(&buf);
+    const stderr = &errstream;
+
+    nosuspend try stderr.print("[{d}] ", .{std.time.timestamp()});
+    nosuspend try stderr.print("[{s}{s}\x1b[0m] ", .{ log_level.color(), @tagName(log_level) });
     // if (opt_src) |src| {
-    nosuspend stderr.print("[{s}:{s}] => ", .{ file_name, line }) catch return;
+    nosuspend try stderr.print("[{s}:{s}] => ", .{ file_name, line });
     // }
-    nosuspend stderr.print(fmt, args) catch return;
-    nosuspend stderr.print("\n", .{}) catch return;
+    nosuspend try stderr.print(fmt, args);
+    nosuspend try stderr.print("\n", .{});
+    std.debug.print("{s}", .{stderr.buffer[0..stderr.end]});
+    try stderr.flush();
 }
 
 pub fn warn(

@@ -42,10 +42,16 @@ const Colors = struct {
     const RESET = "\x1b[0m";
 };
 
+const BreadCrumbList = std.SinglyLinkedList;
+const BreadCrumbNode = struct {
+    node: BreadCrumbList.Node = .{},
+    data: BreadCrumb = .{},
+};
+
 const Tripwire = @This();
 var errors_count: usize = 0;
 var recorded_error: bool = false;
-breadcrumbs: std.SinglyLinkedList(BreadCrumb) = .{},
+breadcrumbs: BreadCrumbList = .{},
 errors: []Error = undefined,
 payloads: []Treehouse.ValueType,
 client: *Treehouse,
@@ -111,7 +117,9 @@ fn getBasename(path: []const u8) []const u8 {
 }
 
 fn prettyPrintError(err: Error, allocator: std.mem.Allocator) !void {
-    const writer = std.io.getStdOut().writer();
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var writer = &stdout_writer.interface;
 
     // Header with error symbol
     try writer.print("\n{s}{s}╭─ 🚨 ERROR DETAILS {s}\n", .{ Colors.RED, Colors.BOLD, Colors.RESET });
@@ -185,7 +193,7 @@ fn prettyPrintErrorCompact(err: Error) void {
 
 pub fn loopRecordErrors(tw: *Tripwire) void {
     while (true) {
-        std.time.sleep(5_000_000_000);
+        std.Thread.sleep(5_000_000_000);
         if (recorded_error and tw.errors.len > errors_count - 1) {
             prettyPrintError(tw.errors[errors_count - 1], tw.allocator.*) catch return;
             recorded_error = false;
@@ -210,7 +218,7 @@ fn sendErrors(tw: *Tripwire) void {
         const err_struct = tw.errors[i];
         defer tw.allocator.free(err_struct.error_name);
         defer tw.allocator.free(err_struct.function);
-        const payload = std.json.stringifyAlloc(tw.allocator.*, err_struct, .{}) catch {
+        const payload = std.json.Stringify.valueAlloc(tw.allocator.*, err_struct, .{}) catch {
             std.log.err("Could not stringify the payload for the errors", .{});
             return;
         };
@@ -243,11 +251,10 @@ pub fn getErrors(tw: *Tripwire) ![]Error {
 }
 
 pub fn recordBreadCrumb(tw: *Tripwire) void {
-    tw.breadcrumbs.prepend(.{
-        .data = BreadCrumb{
-            .event = .HTTP,
-        },
-    });
+    var bread_crumb = BreadCrumbNode{
+        .data = .{ .event = .HTTP },
+    };
+    tw.breadcrumbs.prepend(&bread_crumb.node);
 }
 
 test "lpushmanyAny" {

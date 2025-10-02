@@ -9,7 +9,7 @@ const log = std.log.scoped(.tcp_demo);
 const Logger = @import("Logger.zig");
 const Parsed = std.json.Parsed;
 const net = std.net;
-const Loom = @import("engine/Loom.zig");
+// const Loom = @import("engine/Loom.zig");
 const Scheduler = @import("engine/async/Scheduler.zig");
 const Radix = @import("trees/radix.zig");
 const Cors = @import("core/Cors.zig");
@@ -23,18 +23,23 @@ const process = @import("handler.zig").handle;
 const Ctx_pm = @import("handler.zig").Ctx_pm;
 const StringBuilder = @import("core/builders.zig").String;
 const ContentType = @import("helpers.zig").ContentType;
+const loompkg = @import("loom");
+const Loom = loompkg.Loom;
+const Client = loompkg.Client;
 
 pub const Reverb = @This();
-pub const Config = Loom.Config;
+pub const Config = struct {
+    max: usize = 256,
+};
 pub var instance: *Reverb = undefined;
 var use_cors: bool = false;
 // Radix tree
 routes: [5]Radix,
 arena: *Allocator,
-config: Loom.Config,
+config: Config,
 tracking_allocator: ?*TrackingAllocator,
 // cors: ?Cors = null,
-logger: Logger,
+logger: Logger = undefined,
 // Event Loop
 loom: Loom,
 tripwire: Tripwire = undefined,
@@ -81,7 +86,7 @@ const MethodLookup = struct {
     }
 }.init();
 
-fn parseMiddleWare(func_num: usize, my_Handler: HandlerFunc, middleswares: []const MiddleFunc, ctx: *Context) !void {
+fn parseMiddleWare(func_num: usize, my_Handler: HandlerFunc, middleswares: []const MiddleFunc) !void {
     if (func_num + 1 > middleswares.len) {
         my_Handler(ctx) catch |err| {
             log.debug("Handler error: {any}", .{err});
@@ -92,7 +97,7 @@ fn parseMiddleWare(func_num: usize, my_Handler: HandlerFunc, middleswares: []con
         const wrappedFunc = first_func(my_Handler, ctx) catch |err| {
             return err;
         };
-        try parseMiddleWare(func_num + 1, wrappedFunc, middleswares, ctx);
+        try parseMiddleWare(func_num + 1, wrappedFunc, middleswares);
     }
 }
 
@@ -182,7 +187,7 @@ pub fn get(
 ///
 /// # Returns:
 /// !void.
-pub fn post(
+pub fn delete(
     reverb: *Reverb,
     path: []const u8,
     handler: HandlerFunc,
@@ -198,6 +203,41 @@ pub fn post(
     }
     // Add the path to the appropriate endpoints array
     try addToEndpoints(&Metrics.end_points.DELETE, route_path, reverb.arena.*);
+    return;
+}
+
+
+
+
+
+
+
+/// This function adds the route to the POST radix tree.
+/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+/// # Parameters:
+/// - `target`: *Reverb.
+/// - `path`: []const u8
+/// - `handler`: HandlerFunc
+/// - `middlewares`: []const MiddleFunc
+///
+/// # Returns:
+/// !void.
+pub fn post(
+    reverb: *Reverb,
+    path: []const u8,
+    handler: HandlerFunc,
+    middlewares: []const MiddleFunc,
+) !void {
+    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.POST))];
+    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
+    try radix.addRoute(out, handler, middlewares);
+    const end_colon_op = std.mem.indexOf(u8, path, "/:");
+    var route_path: []const u8 = path;
+    if (end_colon_op) |end_colon| {
+        route_path = path[0..end_colon];
+    }
+    // Add the path to the appropriate endpoints array
+    try addToEndpoints(&Metrics.end_points.POST, route_path, reverb.arena.*);
     return;
 }
 
@@ -353,100 +393,98 @@ pub fn callRoute(reverb: *Reverb, ctx_pm: Ctx_pm, _: *Context) !void {
     const idx = MethodLookup.first_char[ctx_pm.method[0]];
     var radix = reverb.routes[idx];
     // this cuts almost half
-    _ = radix.searchRoute(ctx_pm.path) catch return error.SearchRoute;
+    const entry = radix.searchRoute(ctx_pm.path) catch return error.SearchRoute;
 
-    // if (entry == null) {
-    //     const ret_addr = @returnAddress();
-    //     const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
-    //     // 1) Prepare a big enough buffer on the stack
-    //     var buffer: [512]u8 = undefined;
-    //     // 2) Wrap it in a FixedBufferStream
-    //     var stream = std.io.fixedBufferStream(&buffer);
-    //     const writer = stream.writer();
-    //
-    //     // 3) Call printSourceAtAddress into *your* writer
-    //     const tty = std.io.tty.detectConfig(std.io.getStdErr());
-    //     std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty) catch {};
-    //
-    //     const outSlice = buffer[0..stream.pos];
-    //     const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
-    //     const src = buffer[start..stream.pos];
-    //     var sections = std.mem.splitScalar(u8, src, ':');
-    //     var indents = std.mem.splitScalar(u8, src, '\n');
-    //     const file_name = sections.next() orelse return;
-    //     const line = sections.next() orelse return;
-    //     const u32_line_n: u32 = std.fmt.parseInt(u32, line, 10) catch return;
-    //     _ = indents.next().?;
-    //     const fn_name = indents.next().?;
-    //     const err_str = try std.fmt.allocPrint(reverb.arena.*, "{any}", .{error.MethodNotSupported});
-    //     const function_name = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{fn_name[0 .. fn_name.len - 2]});
-    //     const file_name_alloc = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{file_name});
-    //     _ = Tripwire.Error{
-    //         .timestamp = std.time.timestamp(),
-    //         .error_name = err_str,
-    //         .line = u32_line_n,
-    //         .file = file_name_alloc,
-    //         .request = ctx_pm.path,
-    //         .function = function_name,
-    //     };
-    //     // Reverb.instance.tripwire.recordError(payload);
-    //     return error.RouteNotSupported;
-    // }
-    // if (entry.?.route_func == null) {
-    //     return error.MethodNotSupported;
-    // }
-    // const entry_fn = entry.?.route_func.?.handler_func;
-    // const middlewares = entry.?.route_func.?.middlewares;
-    // const param_args_op = entry.?.param_args;
-    // if (param_args_op) |param_args| {
-    //     if (param_args.items.len > 0) {
-    //         for (param_args.items) |param| {
-    //             ctx.addQueryParam(param.param, param.value) catch return error.AppendQueryParam;
-    //         }
-    //     }
-    // }
-    //
-    // if (middlewares.len > 0) {
-    //     parseMiddleWare(0, entry_fn, middlewares, ctx) catch return error.ParsingMiddleware;
-    // } else {
-    //     entry_fn(ctx) catch |err| {
-    //         const ret_addr = @intFromPtr(entry_fn);
-    //         const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
-    //         // 1) Prepare a big enough buffer on the stack
-    //         var buffer: [512]u8 = undefined;
-    //         // 2) Wrap it in a FixedBufferStream
-    //         var stream = std.io.fixedBufferStream(&buffer);
-    //         const writer = stream.writer();
-    //
-    //         // 3) Call printSourceAtAddress into *your* writer
-    //         const tty = std.io.tty.detectConfig(std.io.getStdErr());
-    //         std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty) catch {};
-    //
-    //         const outSlice = buffer[0..stream.pos];
-    //         const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
-    //         const src = buffer[start..stream.pos];
-    //         var sections = std.mem.splitScalar(u8, src, ':');
-    //         var indents = std.mem.splitScalar(u8, src, '\n');
-    //         const file_name = sections.next() orelse return;
-    //         const file_name_alloc = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{file_name});
-    //         const line = sections.next() orelse return;
-    //         const u32_line_n: u32 = std.fmt.parseInt(u32, line, 10) catch return;
-    //         _ = indents.next().?;
-    //         const fn_name = indents.next().?;
-    //         const err_str = try std.fmt.allocPrint(reverb.arena.*, "{any}", .{error.MethodNotSupported});
-    //         const function_name = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{fn_name[0 .. fn_name.len - 2]});
-    //         const payload = Tripwire.Error{
-    //             .timestamp = std.time.timestamp(),
-    //             .error_name = err_str,
-    //             .line = u32_line_n,
-    //             .file = file_name_alloc,
-    //             .request = ctx_pm.path,
-    //             .function = function_name,
-    //         };
-    //         Reverb.instance.tripwire.recordError(payload);
-    //         return err;
-    //     };
-    // }
+    if (entry == null) {
+        const ret_addr = @returnAddress();
+        const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
+        // 1) Prepare a big enough buffer on the stack
+        var buffer: [512]u8 = undefined;
+        var stream = std.Io.Writer.fixed(&buffer);
+        const writer = &stream;
+
+        // 3) Call printSourceAtAddress into *your* writer
+        const tty = std.io.tty.detectConfig(std.fs.File.stderr());
+        try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
+
+        const outSlice = buffer[0..stream.end];
+        const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
+        const src = buffer[start..stream.end];
+        var sections = std.mem.splitScalar(u8, src, ':');
+        var indents = std.mem.splitScalar(u8, src, '\n');
+        const file_name = sections.next() orelse return;
+        const line = sections.next() orelse return;
+        const u32_line_n: u32 = std.fmt.parseInt(u32, line, 10) catch return;
+        _ = indents.next().?;
+        const fn_name = indents.next().?;
+        const err_str = try std.fmt.allocPrint(reverb.arena.*, "{any}", .{error.MethodNotSupported});
+        const function_name = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{fn_name[0 .. fn_name.len - 2]});
+        const file_name_alloc = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{file_name});
+        _ = Tripwire.Error{
+            .timestamp = std.time.timestamp(),
+            .error_name = err_str,
+            .line = u32_line_n,
+            .file = file_name_alloc,
+            .request = ctx_pm.path,
+            .function = function_name,
+        };
+        // Reverb.instance.tripwire.recordError(payload);
+        return error.RouteNotSupported;
+    }
+    if (entry.?.route_func == null) {
+        return error.MethodNotSupported;
+    }
+    const entry_fn = entry.?.route_func.?.handler_func;
+    const middlewares = entry.?.route_func.?.middlewares;
+    const param_args_op = entry.?.param_args;
+    if (param_args_op) |param_args| {
+        if (param_args.items.len > 0) {
+            for (param_args.items) |param| {
+                ctx.addQueryParam(param.param, param.value) catch return error.AppendQueryParam;
+            }
+        }
+    }
+
+    if (middlewares.len > 0) {
+        parseMiddleWare(0, entry_fn, middlewares) catch return error.ParsingMiddleware;
+    } else {
+        entry_fn(ctx) catch |err| {
+            const ret_addr = @intFromPtr(entry_fn);
+            const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
+            // 1) Prepare a big enough buffer on the stack
+            // 1) Prepare a big enough buffer on the stack
+            var buffer: [512]u8 = undefined;
+            var stream = std.Io.Writer.fixed(&buffer);
+            const writer = &stream;
+
+            // 3) Call printSourceAtAddress into *your* writer
+            const tty = std.io.tty.detectConfig(std.fs.File.stderr());
+            try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
+            const outSlice = buffer[0..stream.end];
+            const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
+            const src = buffer[start..stream.end];
+            var sections = std.mem.splitScalar(u8, src, ':');
+            var indents = std.mem.splitScalar(u8, src, '\n');
+            const file_name = sections.next() orelse return;
+            const file_name_alloc = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{file_name});
+            const line = sections.next() orelse return;
+            const u32_line_n: u32 = std.fmt.parseInt(u32, line, 10) catch return;
+            _ = indents.next().?;
+            const fn_name = indents.next().?;
+            const err_str = try std.fmt.allocPrint(reverb.arena.*, "{any}", .{error.MethodNotSupported});
+            const function_name = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{fn_name[0 .. fn_name.len - 2]});
+            const payload = Tripwire.Error{
+                .timestamp = std.time.timestamp(),
+                .error_name = err_str,
+                .line = u32_line_n,
+                .file = file_name_alloc,
+                .request = ctx_pm.path,
+                .function = function_name,
+            };
+            Reverb.instance.tripwire.recordError(payload);
+            return err;
+        };
+    }
 }
 
 // Radix is a Radix tree routes is a hashmap with the method, each method has a radix tree
@@ -469,14 +507,15 @@ pub fn getRoute(t: *Reverb, ctx_pm: Ctx_pm) !?HandlerFunc {
     return entry_fn;
 }
 
-fn createContext(reverb: *Reverb, comptime T: type, data: T) !Context {
-    const ctx = try Context.init(reverb.arena, data);
-    return ctx;
-}
+// fn createContext(reverb: *Reverb, comptime T: type, data: T) !Context {
+//     const ctx = try Context.init(reverb.arena, data);
+//     return ctx;
+// }
 
 /// This is the Cors struct default set to null
 pub var cors: ?Cors = null;
-pub fn new(target: *Reverb, config: Loom.Config, arena: *Allocator, ta: ?*TrackingAllocator) !void {
+pub var ctx: *Context = undefined;
+pub fn new(target: *Reverb, config: Config, arena: *Allocator, ta: ?*TrackingAllocator) !void {
     var radix1: Radix = undefined;
     try radix1.init(arena);
 
@@ -494,14 +533,14 @@ pub fn new(target: *Reverb, config: Loom.Config, arena: *Allocator, ta: ?*Tracki
 
     const routes_map = [5]Radix{ radix1, radix2, radix3, radix4, radix5 };
     var loom: Loom = undefined;
-    try loom.new(config, arena, 0);
+    try loom.new(.{ .callback = process }, arena);
 
     var logger: Logger = undefined;
     logger.init();
-    Buckets.init(arena);
+    // Buckets.init(arena);
 
-    var buckets_thread = try std.Thread.spawn(.{}, Buckets.loop, .{});
-    buckets_thread.detach();
+    // var buckets_thread = try std.Thread.spawn(.{}, Buckets.loop, .{});
+    // buckets_thread.detach();
 
     target.* = .{
         .config = config,
@@ -511,6 +550,19 @@ pub fn new(target: *Reverb, config: Loom.Config, arena: *Allocator, ta: ?*Tracki
         .loom = loom,
         .tracking_allocator = ta,
     };
+
+    ctx = try arena.create(Context);
+    ctx.* = try Context.init(
+        arena,
+        "",
+        "",
+        null,
+        null,
+        ContentType.None,
+        null,
+        20,
+    );
+    ctx.id = 0;
 
     instance = target;
 }
@@ -539,7 +591,7 @@ pub fn deinit(self: *Reverb) void {
         self.arena.free(ep_patch);
     }
 }
-
+//
 fn initTripwire(reverb: *Reverb) !void {
     reverb.tripwire.init(reverb.arena);
 }
@@ -547,7 +599,7 @@ fn initTripwire(reverb: *Reverb) !void {
 pub fn useTripwire(reverb: *Reverb) !void {
     reverb.tripwire.init(reverb.arena);
 }
-
+//
 fn initMetrics(reverb: *Reverb) !void {
     // try metrics.mapRoutes();
     try reverb.addRoute("/metrics/allroutes", .GET, getAllRoutes, &[_]MiddleFunc{});
@@ -566,32 +618,34 @@ pub fn useCors(_: *Reverb, corsConfig: Cors) !void {
 ///
 /// # Returns:
 /// !void.
-pub fn listen(t: *Reverb) !void {
-    try initMetrics(t);
+pub fn listen(reverb: *Reverb) !void {
+    // try initMetrics(t);
 
-    try t.logger.info("Listening on port {any}", .{t.config.server_port}, null);
-    // try initTripwire(t);
+    try reverb.logger.info("Listening on port {any}", .{reverb.loom.config.server_port}, null);
+
+    try initTripwire(reverb);
+    try reverb.loom.listen();
     // defer t.tripwire.deinit();
 
-    if (use_cors) {
-        var str_builder = StringBuilder.new();
-        try cors.?.checkHeadersStr(&str_builder);
-        Context.cors_headers = str_builder.contents[str_builder.start..str_builder.len];
-    }
-    const loom = try t.arena.create(Loom);
-    try loom.new(t.config, t.arena, 0);
-
-    const ctx = try t.arena.create(Context);
-    ctx.* = try Context.init(
-        t.arena,
-        "",
-        "",
-        null,
-        null,
-        ContentType.None,
-        null,
-        20,
-    );
-    ctx.id = 0;
-    try Loom.listen(t, &t.loom, ctx);
+    // if (use_cors) {
+    //     var str_builder = StringBuilder.new();
+    //     try cors.?.checkHeadersStr(&str_builder);
+    //     Context.cors_headers = str_builder.contents[str_builder.start..str_builder.len];
+    // }
+    // const loom = try t.arena.create(Loom);
+    // try loom.new(t.config, t.arena, 0);
+    //
+    // const ctx = try t.arena.create(Context);
+    // ctx.* = try Context.init(
+    //     t.arena,
+    //     "",
+    //     "",
+    //     null,
+    //     null,
+    //     ContentType.None,
+    //     null,
+    //     20,
+    // );
+    // ctx.id = 0;
+    // try Loom.listen(t, &t.loom, ctx);
 }

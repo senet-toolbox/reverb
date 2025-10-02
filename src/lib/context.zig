@@ -8,11 +8,11 @@ const Cookie = @import("core/Cookie.zig");
 // const TLSServer = TLSStruct.TlsServer;
 const print = std.debug.print;
 const Server = @import("server.zig");
-const Client = @import("engine/Client.zig");
+const Client = @import("loom").Client;
 const Header = @import("core/Header.zig");
 const Reply = @import("core/ReplyBuilder.zig");
-const Validation = @import("../../core/Validation.zig");
-const assert_cm = @import("../../utils/index.zig").assert_cm;
+// const Validation = @import("../../core/Validation.zig");
+// const assert_cm = @import("../../utils/index.zig").assert_cm;
 const dom = @import("core/simdjson/dom.zig");
 const posix = std.posix;
 
@@ -209,7 +209,7 @@ fn generateCookieString(self: *Self) ![]const u8 {
     }
 
     // Create ArrayList with pre-allocated capacity
-    var buffer_cookie = try std.ArrayList(u8).initCapacity(self.arena.*, estimated_size);
+    var buffer_cookie = try std.array_list.Managed(u8).initCapacity(self.arena.*, estimated_size);
     defer buffer_cookie.deinit();
 
     // Reset iterator
@@ -1633,25 +1633,25 @@ pub fn param(self: *Self, name: []const u8) ![]const u8 {
 }
 
 // We need to check and sanitize the payload
-pub fn parseSetPayload(self: *Self, haystack: []const u8) !void {
-    var v: Validation = undefined;
-    v.init(&self.arena);
-    const payload_start = std.mem.indexOf(u8, haystack, "\r\n\r\n") orelse {
-        print("Failed to find payload start.\n", .{});
-        return error.PostFailed;
-    } + 4; // Skip the "\r\n\r\n"
-    const payload = haystack[payload_start..];
-
-    // weird error when payload is empty
-    // const sanitized_payload = try v.sanitizeHtml(payload);
-    // v.detectSqlInjection(sanitized_payload) catch |err| {
-    //     return err;
-    // };
-    // v.validateShellSafe(sanitized_payload) catch |err| {
-    //     return err;
-    // };
-    self.http_payload = payload;
-}
+// pub fn parseSetPayload(self: *Self, haystack: []const u8) !void {
+//     var v: Validation = undefined;
+//     v.init(&self.arena);
+//     const payload_start = std.mem.indexOf(u8, haystack, "\r\n\r\n") orelse {
+//         print("Failed to find payload start.\n", .{});
+//         return error.PostFailed;
+//     } + 4; // Skip the "\r\n\r\n"
+//     const payload = haystack[payload_start..];
+//
+//     // weird error when payload is empty
+//     // const sanitized_payload = try v.sanitizeHtml(payload);
+//     // v.detectSqlInjection(sanitized_payload) catch |err| {
+//     //     return err;
+//     // };
+//     // v.validateShellSafe(sanitized_payload) catch |err| {
+//     //     return err;
+//     // };
+//     self.http_payload = payload;
+// }
 
 fn decoder(encoded: []const u8, decoded: *std.ArrayList(u8)) !void {
     var i: usize = 0;

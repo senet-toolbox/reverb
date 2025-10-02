@@ -1,7 +1,7 @@
 const std = @import("std");
 const print = std.debug.print;
 const posix = std.posix;
-const Client = @import("engine/Client.zig");
+const Client = @import("loom").Client;
 const net = std.net;
 // WebSocket opcodes (RFC 6455 Section 5.2)
 pub const Opcode = enum(u4) {
@@ -95,7 +95,7 @@ pub fn sendFrame(client: *Client, opcode: Opcode, payload: []const u8) !void {
     // _ = try client.writeMessage();
     try client.fillWriteBuffer(&header);
     try client.fillWriteBuffer(payload);
-    _ = try client.writeMessage("");
+    _ = try client.writeMessage();
     // try stream.writeAll(&header);
     // try stream.writeAll(payload);
 }

@@ -10,11 +10,11 @@ const Logger = @import("Logger.zig");
 const Radix = @import("trees/radix.zig");
 const helpers = @import("helpers.zig");
 const Buckets = @import("metrics/Buckets.zig");
-const Scheduler = @import("engine/async/Scheduler.zig");
-const xsuspend = Scheduler.xsuspend;
+const Scheduler = @import("loom");
+// const xsuspend = Scheduler.xsuspend;
 // const TLSStruct = @import("tls/tlsserver.zig");
 const Reverb = @import("server.zig");
-const Client = @import("engine/Client.zig");
+const Client = @import("loom").Client;
 // const TLSServer = TLSStruct.TlsServer;
 const mem = std.mem;
 const Parsed = std.json.Parsed;
@@ -67,7 +67,7 @@ pub fn handle(
     // _: *Reverb,
     client: *Client,
     recv_data: []const u8,
-    ctx: *Context,
+    // ctx: *Context,
 ) !void {
     // Buckets.req_count += 1;
     // defer ctx.clear();
@@ -78,10 +78,11 @@ pub fn handle(
         // a link, but doesn't start sending the request until it's
         // clicked. The request eventually times out so we just
         // go agane.
-        try Reverb.instance.logger.warn("Got connection but no header!", .{}, @src());
+        // try Reverb.instance.logger.warn("Got connection but no header!", .{}, @src());
         return;
     }
 
+    const ctx = Reverb.ctx;
     ctx.client = client;
 
     @memcpy(buf[0..recv_data.len], recv_data[0..]);
@@ -93,7 +94,7 @@ pub fn handle(
     ctx.content_type = http_header.content_type;
     ctx.http_header = http_header;
 
-    if (http_header.content_length > Reverb.instance.config.max_body_size) {
+    if (http_header.content_length > Reverb.instance.loom.config.max_body_size) {
         Reverb.instance.logger.err("Request body too large", .{}) catch |log_err| {
             std.log.err("{any}", .{log_err});
         };
@@ -141,7 +142,7 @@ pub fn handle(
 
         // End headers
         try client.fillWriteBuffer("\r\n");
-        _ = try client.writeMessage("");
+        _ = try client.writeMessage();
 
         try WS.sendFrame(client, .Text, "Hello from Server!");
 
@@ -177,51 +178,51 @@ pub fn handle(
 
     Reverb.instance.callRoute(ctx_pm, ctx) catch |err| {
         Reverb.instance.logger.err("{any} Method: {s} Path: {s}", .{ err, ctx_pm.method, ctx_pm.path }) catch |log_err| {
-            std.log.err("{any}", .{log_err});
+            std.log.err("Logger Error: {any}", .{log_err});
         };
         switch (err) {
-            // error.ParsingMiddleware, error.AppendQueryParam, error.SearchRoute => {
-            //     const resp = "HTTP/1.1 404 ERROR\r\n" ++
-            //         "Content-Type: text/html\r\n" ++
-            //         "Content-Length: 0\r\n";
-            //     ctx.RAW(resp) catch |write_err| {
-            //         print("Client Write Error: {any}\n", .{write_err});
-            //     };
-            // },
-            // error.RouteNotSupported => {
-            //     const resp = "HTTP/1.1 404 Route not supported\r\n" ++
-            //         "Content-Type: text/html\r\n" ++
-            //         "Content-Length: 0\r\n";
-            //     ctx.RAW(resp) catch |write_err| {
-            //         print("Client Write Error: {any}\n", .{write_err});
-            //     };
-            //     return;
-            // },
-            // error.MethodNotSupported => {
-            //     const resp = "HTTP/1.1 404 Method not supported\r\n" ++
-            //         "Content-Type: text/html\r\n" ++
-            //         "Content-Length: 0\r\n";
-            //     ctx.RAW(resp) catch |write_err| {
-            //         print("Client Write Error: {any}\n", .{write_err});
-            //     };
-            //     return;
-            // },
-            // error.RequestNotSupported => {
-            //     const resp = "HTTP/1.1 404 Request not supported\r\n" ++
-            //         "Content-Type: text/html\r\n" ++
-            //         "Content-Length: 0\r\n";
-            //     ctx.RAW(resp) catch |write_err| {
-            //         print("Client Write Error: {any}\n", .{write_err});
-            //     };
-            // },
+            error.ParsingMiddleware, error.AppendQueryParam, error.SearchRoute => {
+                const resp = "HTTP/1.1 404 ERROR\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n";
+                ctx.RAW(resp) catch |write_err| {
+                    print("Client Write Error: {any}\n", .{write_err});
+                };
+            },
+            error.RouteNotSupported => {
+                const resp = "HTTP/1.1 404 Route not supported\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n";
+                ctx.RAW(resp) catch |write_err| {
+                    print("Client Write Error: {any}\n", .{write_err});
+                };
+                return;
+            },
+            error.MethodNotSupported => {
+                const resp = "HTTP/1.1 404 Method not supported\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n";
+                ctx.RAW(resp) catch |write_err| {
+                    print("Client Write Error: {any}\n", .{write_err});
+                };
+                return;
+            },
+            error.RequestNotSupported => {
+                const resp = "HTTP/1.1 404 Request not supported\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n";
+                ctx.RAW(resp) catch |write_err| {
+                    print("Client Write Error: {any}\n", .{write_err});
+                };
+            },
             // We need to record the errors
             else => return,
         }
-        xsuspend();
+        // xsuspend();
     };
-    const resp = "HTTP/1.1 200 OK\r\nDate: Tue, 19 Aug 2025 18:37:36 GMT\r\nContent-Length: 7\r\nContent-Type: text/plain charset=utf-8\r\n\r\nSUCCESS";
-    ctx.RAW(resp) catch |write_err| {
-        print("Client Write Error: {any}\n", .{write_err});
-    };
-    xsuspend();
+    // const resp = "HTTP/1.1 200 OK\r\nDate: Tue, 19 Aug 2025 18:37:36 GMT\r\nContent-Length: 7\r\nContent-Type: text/plain charset=utf-8\r\n\r\nSUCCESS";
+    // ctx.RAW(resp) catch |write_err| {
+    //     print("Client Write Error: {any}\n", .{write_err});
+    // };
+    // xsuspend();
 }

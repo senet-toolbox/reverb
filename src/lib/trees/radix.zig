@@ -28,7 +28,7 @@ const RouteFunc = struct {
 const ParamInfo = struct { param: []const u8, value: []const u8 };
 const RouteHandler = struct {
     route_func: ?RouteFunc,
-    param_args: ?*std.ArrayList(ParamInfo) = null,
+    param_args: ?*std.array_list.Managed(ParamInfo) = null,
 };
 
 const Radix = @This();
@@ -295,7 +295,7 @@ pub fn findNeedle(slice: []const u8, needle: u8) usize {
 
 // /api/test
 pub fn searchRoute(radix: *const Radix, path: []const u8) !?RouteHandler {
-    var param_args: ?*std.ArrayList(ParamInfo) = null;
+    var param_args: ?*std.array_list.Managed(ParamInfo) = null;
     var node = radix.root;
     var start: usize = 1;
 
@@ -335,8 +335,8 @@ pub fn searchRoute(radix: *const Radix, path: []const u8) !?RouteHandler {
 
             // Lazy initialization of param_args
             if (param_args == null) {
-                param_args = try radix.allocator.create(std.ArrayList(ParamInfo));
-                param_args.?.* = std.ArrayList(ParamInfo).init(radix.allocator);
+                param_args = try radix.allocator.create(std.array_list.Managed(ParamInfo));
+                param_args.?.* = std.array_list.Managed(ParamInfo).init(radix.allocator);
             }
 
             try param_args.?.append(.{
@@ -440,13 +440,13 @@ fn insert(
 }
 
 fn printTree(radix: *const Radix) !void {
-    var buffer = std.ArrayList(u8).init(radix.allocator);
+    var buffer = std.array_list.Managed(u8).init(radix.allocator);
     defer buffer.deinit();
     // Start traversal from the root's children (root itself has no prefix)
     try printNode(radix.root, &buffer);
 }
 
-fn printNode(node: *const Node, buffer: *std.ArrayList(u8)) !void {
+fn printNode(node: *const Node, buffer: *std.array_list.Managed(u8)) !void {
     // Save current buffer length to backtrack later
     const original_len = buffer.items.len;
 
