@@ -63,6 +63,7 @@ pub const ContentType = enum {
     Form,
     MultiForm,
     JSON,
+    WASM,
 };
 
 pub const HTTPHeader = struct {
@@ -89,25 +90,26 @@ pub const HTTPHeader = struct {
     ws_version: []const u8 = "",
     ws_client_key: []const u8 = "",
     referer: []const u8 = "",
+    _buffer: [8192 * 4]u8 = undefined,
 
     pub fn init(_: *std.mem.Allocator) !HTTPHeader {
         return HTTPHeader{
-            .request_line = undefined,
-            .host = undefined,
-            .upgrade = undefined,
-            .accept = undefined,
-            .user_agent = undefined,
-            .cookie = undefined,
+            .request_line = "",
+            .host = "",
+            .upgrade = "",
+            .accept = "",
+            .user_agent = "",
+            .cookie = "",
             // .cookies = std.ArrayList([]const u8).init(arena.*),
-            .method = undefined,
+            .method = "",
             .content_type = ContentType.None,
-            .accept_language = undefined,
-            .accept_encoding = undefined,
+            .accept_language = "",
+            .accept_encoding = "",
             .accept_control_request_method = null,
-            .accept_control_request_headers = undefined,
+            .accept_control_request_headers = "",
             .boundary = null,
-            .ws_version = undefined,
-            .ws_client_key = undefined,
+            .ws_version = "",
+            .ws_client_key = "",
         };
     }
 
@@ -470,10 +472,20 @@ const MethodTrie = struct {
 // Host: 127.0.0.1:8080
 
 var http_header: HTTPHeader = HTTPHeader{};
-pub fn parseHeaders(payload: []const u8, ctx_pm: *Ctx_pm) *HTTPHeader {
+pub fn parseHeaders(new_payload: []const u8, ctx_pm: *Ctx_pm) !*HTTPHeader {
+    http_header = HTTPHeader{};
+    @memcpy(http_header._buffer[0..new_payload.len], new_payload);
+    var payload = http_header._buffer[0..new_payload.len];
     // Allocate space for the copy (same length as original)
     var i: usize = 0;
     var line_start: usize = 0;
+
+    if (std.mem.indexOf(u8, new_payload, "Accept-Encoding:")) |index| {
+        const start = index + 16;
+        var end = std.mem.indexOf(u8, new_payload[start..], "\r\n") orelse return error.MalformedRequest;
+        end += start;
+        http_header.accept_encoding = new_payload[start..end];
+    }
 
     switch (HeaderLookup.first_char[payload[0]]) {
         1 => ctx_pm.method = commonStrings.get,
@@ -499,7 +511,7 @@ pub fn parseHeaders(payload: []const u8, ctx_pm: *Ctx_pm) *HTTPHeader {
     i = request_line_sentinal + 1;
     line_start = i + 1;
 
-    const last = findCRLFCRLF(payload).?;
+    const last = findCRLFCRLF(payload) orelse return error.MalformedRequest;
     http_header.body = payload[last + 4 ..];
     while (i < last) : (i += 1) {
         const c = payload[i];
@@ -537,6 +549,7 @@ pub fn parseHeaders(payload: []const u8, ctx_pm: *Ctx_pm) *HTTPHeader {
                                 'a' => {
                                     if (value[12] == 'x') continue :type_sw 'x';
                                     if (value[12] == 'j') continue :type_sw 'j';
+                                    if (value[12] == 'w') continue :type_sw 'w';
                                 },
                                 't' => {
                                     http_header.content_type = ContentType.Text;
@@ -549,6 +562,9 @@ pub fn parseHeaders(payload: []const u8, ctx_pm: *Ctx_pm) *HTTPHeader {
                                 },
                                 'm' => {
                                     http_header.content_type = ContentType.MultiForm;
+                                },
+                                'w' => {
+                                    http_header.content_type = ContentType.WASM;
                                 },
                                 else => unreachable,
                             }
@@ -563,7 +579,7 @@ pub fn parseHeaders(payload: []const u8, ctx_pm: *Ctx_pm) *HTTPHeader {
             },
             7 => if (line_start + 7 < payload.len) switch (payload[line_start + 7]) {
                 'L' => http_header.accept_language = value,
-                'E' => http_header.accept_encoding = value,
+                'E' => {},
                 'C' => if (line_start + 23 < payload.len) switch (payload[line_start + 23]) {
                     'M' => http_header.accept_control_request_method = value,
                     'H' => http_header.accept_control_request_headers = value,

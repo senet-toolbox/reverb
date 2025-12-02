@@ -52,8 +52,9 @@ fn log(
     logger.mutex.lock();
     defer logger.mutex.unlock();
     // const stderr = std.io.getStdErr().writer();
-    var errstream = std.Io.Writer.fixed(&buf);
-    const stderr = &errstream;
+    var errbuf: [512]u8 = undefined;
+    var errstream = std.Io.Writer.fixed(&errbuf);
+    var stderr = &errstream;
 
     nosuspend try stderr.print("[{d}] ", .{std.time.timestamp()});
     nosuspend try stderr.print("[{s}{s}\x1b[0m] ", .{ log_level.color(), @tagName(log_level) });
@@ -61,7 +62,7 @@ fn log(
     nosuspend try stderr.print("[{s}:{s}] => ", .{ file_name, line });
     // }
     nosuspend try stderr.print(fmt, args);
-    nosuspend try stderr.print("\n", .{});
+    nosuspend try stderr.writeByte('\n');
     std.debug.print("{s}", .{stderr.buffer[0..stderr.end]});
     try stderr.flush();
 }

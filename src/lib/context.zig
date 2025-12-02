@@ -15,6 +15,8 @@ const Reply = @import("core/ReplyBuilder.zig");
 // const assert_cm = @import("../../utils/index.zig").assert_cm;
 const dom = @import("core/simdjson/dom.zig");
 const posix = std.posix;
+const loompkg = @import("loom");
+const xsuspend = loompkg.xsuspend;
 
 pub const json_type = []const u8;
 
@@ -40,7 +42,7 @@ const Data = struct {
 };
 
 const MultiForm = struct {
-    form_data: std.ArrayList(Data),
+    form_data: std.array_list.Managed(Data),
 };
 
 pub const SSL: i32 = 0;
@@ -105,7 +107,7 @@ pub fn init(
     parser.* = try dom.Parser.initFixedBuffer(arena.*, "", .{});
     var form_params = std.StringHashMap([]const u8).init(arena.*);
     const req_cookies = try arena.alloc(Cookie, cookie_size);
-    const query_params = try arena.alloc(Param, cookie_size);
+    const query_params = try arena.alloc(Param, 256);
     const params = try arena.alloc(Param, cookie_size);
     return Self{
         .arena = arena,
@@ -208,7 +210,7 @@ fn generateCookieString(self: *Self) ![]const u8 {
         if (cookie.http_only) estimated_size += 8; // "HttpOnly"
     }
 
-    // Create ArrayList with pre-allocated capacity
+    // Create array_list.Managed with pre-allocated capacity
     var buffer_cookie = try std.array_list.Managed(u8).initCapacity(self.arena.*, estimated_size);
     defer buffer_cookie.deinit();
 
@@ -256,7 +258,7 @@ fn generateCookieString(self: *Self) ![]const u8 {
 }
 
 // fn generateCookieString(self: *Self) ![]const u8 {
-//     var buffer_cookie = std.ArrayList(u8).init(self.arena.*);
+//     var buffer_cookie = std.array_list.Managed(u8).init(self.arena.*);
 //     defer buffer_cookie.deinit();
 //
 //     var cookies_itr = self.cookies.iterator();
@@ -449,13 +451,14 @@ pub const String = struct {
 const string_success_resp =
     "HTTP/1.1 200 OK\r\n" ++
     "Vary: Origin\r\n" ++
+    // "Date: Fri, 31 Oct 2025 15:59:12 GMT\r\n" ++
     "Content-Type: text/plain charset=utf-8\r\n";
 // "Connection: close\r\n" ++
 // "Content-Type: text/html\r\n";
 
 // const resp = "HTTP/1.1 200 OK\r\nDate: Tue, 19 Aug 2025 18:37:36 GMT\r\nContent-Length: 7\r\nContent-Type: text/plain charset=utf-8\r\n\r\nSUCCESS";
 
-var buffer: [65535]u8 = undefined;
+var buffer: [5_000_000]u8 = undefined;
 pub fn STRING(self: *Self, payload: []const u8) !void {
     var end: usize = string_success_resp.len;
     var start: usize = 0;
@@ -517,68 +520,110 @@ pub fn STRING(self: *Self, payload: []const u8) !void {
 
     end += payload.len;
     @memcpy(buffer[start..end], payload);
-    _ = try posix.write(self.client.?.socket, buffer[0..end]);
+    try stream(self.client.?, buffer[0..end]);
+    // _ = try posix.write(self.client.?.socket, buffer[0..end]);
 }
 
-// const resp =
-//     "HTTP/1.1 200 OK\r\n" ++
-//     "Vary: Accept-Encoding, Origin\r\n" ++
-//     "Connection: Keep-Alive\r\n" ++
-//     "Content-Type: text/html; charset=utf8\r\n" ++
-//     "Content-Length: 0\r\n" ++
-//     "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n" ++
-//     "Access-Control-Allow-Origin: http://localhost:5173\r\n" ++
-//     "Access-Control-Allow-Headers: Content-Type\r\n" ++
-//     "Access-Control-Allow-Credentials: false\r\n" ++
-//     "Access-Control-Max-Age: 86400\r\n\r\n";
+pub fn FILE(self: *Self, file: std.fs.File) !void {
+    const stat = try file.stat();
+    const file_success_resp =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Vary: Origin\r\n";
 
-pub fn RAW(self: *Self, raw: []const u8) !void {
-    // const end: usize = raw.len;
-    // const start: usize = 0;
+    var end: usize = file_success_resp.len;
+    var start: usize = 0;
 
     // Success Response
-    // @memcpy(buffer[start..end], raw);
-    // start = raw.len;
+    @memcpy(buffer[start..end], file_success_resp);
+    start = file_success_resp.len;
 
-    // // Cors
-    // if (cors_headers) |ch| {
-    //     end += ch.len;
-    //     @memcpy(buffer[start..end], ch);
-    //     start += ch.len;
+    const ctnt_type = "Content-Type: ";
+    end += ctnt_type.len;
+    @memcpy(buffer[start..end], ctnt_type);
+    start += ctnt_type.len;
+
+    const mime = mimeForPath(self.route);
+    end += mime.len;
+    @memcpy(buffer[start..end], mime);
+    start += mime.len;
+
+    // Cors
+    if (cors_headers) |ch| {
+        end += ch.len;
+        @memcpy(buffer[start..end], ch);
+        start += ch.len;
+    }
+
+    if (self.http_header.accept_control_request_headers.len > 0) {
+        const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
+        end += access_ctrl_req_headers.len;
+        @memcpy(buffer[start..end], access_ctrl_req_headers);
+        start += access_ctrl_req_headers.len;
+
+        end += self.http_header.accept_control_request_headers.len;
+        @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
+        start += self.http_header.accept_control_request_headers.len;
+
+        end += 2;
+        @memcpy(buffer[start..end], "\r\n");
+        start += 2;
+    }
+
+    end += ctnt.len;
+    @memcpy(buffer[start..end], ctnt);
+    start += ctnt.len;
+
+    // if (std.mem.indexOf(u8, self.http_header.path, ".wasm")) |_| {
+    //     std.debug.print("{s}\n", .{buffer[0..end]});
+    //     if (self.http_header.accept_encoding.len > 0) {
+    //         std.debug.print("Accept Encoding: {s}\n", .{self.http_header.accept_encoding});
+    //         const access_ctrl_req_headers = "Content-Encoding: ";
+    //         end += access_ctrl_req_headers.len;
+    //         @memcpy(buffer[start..end], access_ctrl_req_headers);
+    //         start += access_ctrl_req_headers.len;
+    //
+    //         end += 2;
+    //         @memcpy(buffer[start..end], "br");
+    //         std.debug.print("-----: {s}\n", .{buffer[start - access_ctrl_req_headers.len .. end]});
+    //         start += 2;
+    //
+    //         end += 2;
+    //         @memcpy(buffer[start..end], "\r\n");
+    //         start += 2;
+    //     }
     // }
-    //
-    // if (self.http_header.accept_control_request_headers.len > 0) {
-    //     const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
-    //     end += access_ctrl_req_headers.len;
-    //     @memcpy(buffer[start..end], access_ctrl_req_headers);
-    //     start += access_ctrl_req_headers.len;
-    //
-    //     end += self.http_header.accept_control_request_headers.len;
-    //     @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
-    //     start += self.http_header.accept_control_request_headers.len;
-    //
-    //     end += 2;
-    //     @memcpy(buffer[start..end], "\r\n");
-    //     start += 2;
-    // }
 
-    // const access_ctrl_req_methods = "Access-Control-Allow-Method: ";
-    // end += access_ctrl_req_methods.len;
-    // @memcpy(buffer[start..end], access_ctrl_req_methods);
-    // start += access_ctrl_req_methods.len;
-    //
-    // end += self.http_header.accept_control_request_method.len;
-    // @memcpy(buffer[start..end], self.http_header.accept_control_request_method);
-    // start += self.http_header.accept_control_request_method.len;
-    //
-    // end += 2;
-    // @memcpy(buffer[start..end], "\r\n");
-    // start += 2;
+    const max_len = 32;
+    var buf: [max_len]u8 = undefined;
+    const numAsString = try std.fmt.bufPrint(&buf, "{}", .{stat.size});
+    end += numAsString.len;
+    @memcpy(buffer[start..end], numAsString);
+    start += numAsString.len;
 
-    // end += 2;
-    // @memcpy(buffer[start..end], "\r\n");
-    // start += 2;
-    _ = try posix.write(self.client.?.socket, raw);
+    end += 2;
+    @memcpy(buffer[start..end], "\r\n");
+    start += 2;
+
+    const cookie_str = try self.generateCookieString();
+
+    end += cookie_str.len;
+    @memcpy(buffer[start..end], cookie_str);
+    start += cookie_str.len;
+
+    const client = self.client.?;
+    try client.write(buffer[0..end]);
+
+    end += stat.size;
+    try client.sendFile(file);
+}
+
+fn stream(client: *Client, payload: []const u8) !void {
+    client.chunked(payload) catch |err| {
+        return err;
+    };
+}
+pub fn RAW(self: *Self, raw: []const u8) !void {
+    try stream(self.client.?, raw);
 }
 
 fn getUnderlyingType(comptime T: type) type {
@@ -1486,13 +1531,13 @@ pub fn ARRAY(self: *Self, comptime T: type, data: T) !void {
 }
 
 pub fn JSON(self: *Self, comptime T: type, data: T) !void {
-    // var writer = String.new();
-    // try fastJson(T, data, &writer);
-    var payload_arr = std.ArrayList(u8).init(self.arena.*);
-    defer payload_arr.deinit();
-    // Here the writer writes in bytes
-    try std.json.stringify(data, .{}, payload_arr.writer());
-    const payload = try payload_arr.toOwnedSlice();
+    const fmt = std.json.fmt(data, .{ .whitespace = .indent_2 });
+
+    var writer = std.Io.Writer.Allocating.init(self.arena.*);
+    try fmt.format(&writer.writer);
+
+    const payload = try writer.toOwnedSlice();
+
     // const payload = writer.contents[0..writer.len];
 
     var end: usize = success_resp.len;
@@ -1543,46 +1588,95 @@ pub fn JSON(self: *Self, comptime T: type, data: T) !void {
     _ = try posix.write(self.client.?.socket, buffer[0..end]);
 }
 
-pub fn HTML(self: *Self, payload: []const u8) !void {
-    var reply: Reply = undefined;
-    try reply.init(self.arena);
-    try reply.writeHttpProto("HTTP/1.1 200 Success ");
-    defer reply.deinit();
+// When testing with wrk remove connection close
+const html_success_resp =
+    "HTTP/1.1 200 OK\r\n" ++
+    "Vary: Origin\r\n" ++
+    "Content-Type: text/html; charset=utf8\r\n";
 
-    const max_len = 20;
+const mimeTypes = .{
+    .{ ".html", "text/html; charset=utf8\r\n" },
+    .{ ".js", "application/javascript\r\n" },
+    .{ ".wasm", "application/wasm\r\n" },
+    .{ ".css", "text/css\r\n" },
+    .{ ".png", "image/png\r\n" },
+    .{ ".jpg", "image/jpeg\r\n" },
+    .{ ".webp", "image/webp\r\n" },
+    .{ ".gif", "image/gif\r\n" },
+    .{ ".svg", "image/svg+xml\r\n" },
+    .{ ".txt", "text/html; charset=utf8\r\n" },
+    .{ ".woff", "font/woff\r\n" },
+    .{ ".woff2", "font/woff2\r\n" },
+};
+
+pub fn mimeForPath(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    inline for (mimeTypes) |kv| {
+        if (std.mem.eql(u8, extension, kv[0])) {
+            return kv[1];
+        }
+    }
+    return "text/html; charset=utf8\r\n";
+}
+
+pub fn HTML(self: *Self, payload: []const u8) !void {
+    var end: usize = html_success_resp.len;
+    var start: usize = 0;
+
+    // Success Response
+    @memcpy(buffer[start..end], html_success_resp);
+    start = html_success_resp.len;
+
+    // Cors
+    if (cors_headers) |ch| {
+        end += ch.len;
+        @memcpy(buffer[start..end], ch);
+        start += ch.len;
+    }
+
+    if (self.http_header.accept_control_request_headers.len > 0) {
+        const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
+        end += access_ctrl_req_headers.len;
+        @memcpy(buffer[start..end], access_ctrl_req_headers);
+        start += access_ctrl_req_headers.len;
+
+        end += self.http_header.accept_control_request_headers.len;
+        @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
+        start += self.http_header.accept_control_request_headers.len;
+
+        end += 2;
+        @memcpy(buffer[start..end], "\r\n");
+        start += 2;
+    }
+
+    end += ctnt.len;
+    @memcpy(buffer[start..end], ctnt);
+    start += ctnt.len;
+
+    const max_len = 4;
     var buf: [max_len]u8 = undefined;
     const numAsString = try std.fmt.bufPrint(&buf, "{}", .{payload.len});
+    end += numAsString.len;
+    @memcpy(buffer[start..end], numAsString);
+    start += numAsString.len;
 
-    var headers: Header = undefined;
-    headers.init(.{
-        .content_length = .{ .override = numAsString },
-        .content_type = .{ .override = "text/html; charset=utf8" },
-        .connection = .{ .override = "close" },
-        .vary = .{ .override = "Origin" },
-    });
+    end += 2;
+    @memcpy(buffer[start..end], "\r\n");
+    start += 2;
 
-    try reply.writeHeaders(&headers, &Server.cors.?);
+    const cookie_str = try self.generateCookieString();
 
-    if (self.cookies.count() > 0) {
-        var builder = try self.generateCookieString();
-        defer builder.deinit(self.arena);
-        try reply.writeCookies(builder.data[0..builder.len()]);
-    }
+    end += cookie_str.len;
+    @memcpy(buffer[start..end], cookie_str);
+    start += cookie_str.len;
 
-    try reply.payload(payload);
-
-    const response = try reply.getData();
-    defer self.arena.free(response);
-
-    if (self.ssl != null) {
-        tlsWrite(self.ssl.?, response);
-    } else {
-        try httpWrite(self.client.?, response);
-    }
+    end += payload.len;
+    @memcpy(buffer[start..end], payload);
+    _ = try posix.write(self.client.?.socket, buffer[0..end]);
 }
 
 pub fn SET(self: *Self, key: []const u8, comptime T: type, data: T) !void {
-    var json = std.ArrayList(u8).init(self.arena);
+    var json = std.array_list.Managed(u8).init(self.arena);
     defer json.deinit();
     try std.json.stringify(data, .{}, json.writer());
     const json_str = json.toOwnedSlice();
@@ -1653,7 +1747,7 @@ pub fn param(self: *Self, name: []const u8) ![]const u8 {
 //     self.http_payload = payload;
 // }
 
-fn decoder(encoded: []const u8, decoded: *std.ArrayList(u8)) !void {
+fn decoder(encoded: []const u8, decoded: *std.array_list.Managed(u8)) !void {
     var i: usize = 0;
     while (i < encoded.len) : (i += 1) {
         if (encoded[i] == '%') {
@@ -1689,14 +1783,14 @@ pub fn parseForm(self: *Self) !void {
             if (findIndex(payload[pos..], '&')) |vi| {
                 const form_value = payload[pos .. vi + pos];
                 pos += vi;
-                var decoded = std.ArrayList(u8).init(self.arena.*);
+                var decoded = std.array_list.Managed(u8).init(self.arena.*);
                 try decoder(form_value, &decoded);
                 const resp = try decoded.toOwnedSlice();
                 try self.addFormParam(form_key, resp);
             } else {
                 const form_value = payload[pos..];
                 pos = sentinal;
-                var decoded = std.ArrayList(u8).init(self.arena.*);
+                var decoded = std.array_list.Managed(u8).init(self.arena.*);
                 try decoder(form_value, &decoded);
                 const resp = try decoded.toOwnedSlice();
                 try self.addFormParam(form_key, resp);
@@ -1714,7 +1808,7 @@ pub fn parseMulti(self: *Self) !void {
     // while (pos < sentinal) {
     // }
     var multi_form: MultiForm = MultiForm{
-        .form_data = std.ArrayList(Data).init(self.arena.*),
+        .form_data = std.array_list.Managed(Data).init(self.arena.*),
     };
     var boundary_itr = mem.tokenizeSequence(u8, payload, boundary);
     _ = boundary_itr.next();
@@ -1764,6 +1858,7 @@ pub fn parseMulti(self: *Self) !void {
 /// # Parameters:
 /// - `Context`: *Context.
 /// - `T`: StructType.
+/// - `value`: *T.
 ///
 /// # Returns:
 /// Struct.

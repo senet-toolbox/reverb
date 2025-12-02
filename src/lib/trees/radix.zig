@@ -34,6 +34,7 @@ const RouteHandler = struct {
 const Radix = @This();
 allocator: std.mem.Allocator,
 root: *Node,
+universal_mode: bool = false,
 
 fn findCommonPrefix(a: []const u8, b: []const u8) usize {
     var i: usize = 0;
@@ -102,7 +103,7 @@ pub fn findCommonPrefixSIMDOptimized(a: []const u8, b: []const u8) usize {
     while (i + 8 <= len) : (i += 8) {
         const a_chunk = std.mem.readInt(u64, a[i..][0..8], .little);
         const b_chunk = std.mem.readInt(u64, b[i..][0..8], .little);
-        
+
         if (a_chunk != b_chunk) {
             // Find the first differing byte using XOR and trailing zeros
             const diff = a_chunk ^ b_chunk;
@@ -115,7 +116,7 @@ pub fn findCommonPrefixSIMDOptimized(a: []const u8, b: []const u8) usize {
     while (i + 4 <= len) : (i += 4) {
         const a_chunk = std.mem.readInt(u32, a[i..][0..4], .little);
         const b_chunk = std.mem.readInt(u32, b[i..][0..4], .little);
-        
+
         if (a_chunk != b_chunk) {
             const diff = a_chunk ^ b_chunk;
             const byte_offset = @ctz(diff) / 8;
@@ -125,7 +126,7 @@ pub fn findCommonPrefixSIMDOptimized(a: []const u8, b: []const u8) usize {
 
     // Handle remaining bytes with scalar comparison
     while (i < len and a[i] == b[i]) : (i += 1) {}
-    
+
     return i;
 }
 
@@ -295,9 +296,22 @@ pub fn findNeedle(slice: []const u8, needle: u8) usize {
 
 // /api/test
 pub fn searchRoute(radix: *const Radix, path: []const u8) !?RouteHandler {
+    if (radix.universal_mode) {
+        return RouteHandler{
+            .route_func = radix.root.value,
+        };
+    }
     var param_args: ?*std.array_list.Managed(ParamInfo) = null;
     var node = radix.root;
     var start: usize = 1;
+
+    if (path.len == 1) {
+        if (node.is_end) {
+            return RouteHandler{
+                .route_func = node.value,
+            };
+        }
+    }
 
     // Manually parse path segments to avoid iterator overhead
     while (start < path.len) : (start += 1) {
@@ -372,6 +386,19 @@ pub fn addRoute(
     try radix.insert(&path_iter, handler, middlewares);
 }
 
+pub fn addUniversalRoute(
+    radix: *Radix,
+    handler: HandlerFunc,
+    middlewares: []const MiddleFunc,
+) !void {
+    radix.universal_mode = true;
+    const route_func = RouteFunc{
+        .handler_func = handler,
+        .middlewares = middlewares,
+    };
+    radix.root.value = route_func;
+}
+
 fn insert(
     radix: *Radix,
     segments: *mem.TokenIterator(u8, .scalar),
@@ -383,6 +410,13 @@ fn insert(
         .handler_func = handler,
         .middlewares = middlewares,
     };
+
+    if (segments.peek() == null) {
+        node.value = route_func;
+        node.is_end = true;
+        return;
+    }
+
     while (segments.next()) |segment| {
         var segement_remaining = segment;
         const is_dynamic = segment[0] == ':';
