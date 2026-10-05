@@ -96,6 +96,24 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ------------------------------------------------------------------
+    // The README quickstart, compiled as part of the normal build so the
+    // first code a reader runs cannot silently rot.
+    // ------------------------------------------------------------------
+    const readme_example = b.addExecutable(.{
+        .name = "readme_quickstart",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/readme_quickstart.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "reverb", .module = mod },
+            },
+        }),
+    });
+    const check_readme = b.step("check-readme", "Compile the README quickstart");
+    check_readme.dependOn(&readme_example.step);
+
+    // ------------------------------------------------------------------
     // Tests.
     //
     // Zig only collects `test` blocks from the *root* file of a test

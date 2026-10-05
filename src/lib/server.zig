@@ -925,7 +925,10 @@ pub fn Server(comptime Config: type) type {
         /// silently overwriting.
         var signal_target: ?*Reverb = null;
 
-        fn handleShutdownSignal(_: c_int) callconv(.c) void {
+        // The signal-number type is platform-specific (an enum on Darwin, an
+        // integer elsewhere), so it is taken from `Sigaction` rather than
+        // spelled out.
+        fn handleShutdownSignal(_: posix.SIG) callconv(.c) void {
             // Only async-signal-safe work here: an atomic store and a write
             // to the wake pipe, both of which `stop` is careful to keep safe.
             if (signal_target) |target| target.stop();
