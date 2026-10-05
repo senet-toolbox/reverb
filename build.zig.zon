@@ -37,7 +37,13 @@
     // internet connectivity.
     .dependencies = .{
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
-        .loom = .{ .path = "../loom" },
+        // Pinned by commit so the repository builds without a sibling
+        // checkout. To develop against a local Loom, swap this for
+        // `.{ .path = "../loom" }` temporarily — don't commit that form.
+        .loom = .{
+            .url = "git+https://github.com/tether-labs/Loom.git#58c08d8edf5bf659992faa5ce574b5ce655153f2",
+            .hash = "loom-0.0.0--12JvspkBACW0RwODMvKvhlAxpXGeg3giQ3Z28KmjTbL",
+        },
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
         //    // `hash`, otherwise you are communicating that you expect to find the old hash at
