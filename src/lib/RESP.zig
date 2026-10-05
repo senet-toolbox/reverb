@@ -222,7 +222,7 @@ pub const RESP = union(enum) {
             // .dll => {
             //     return null;
             // },
-            .int =>  {
+            .int => {
                 return null;
             },
             .float => {

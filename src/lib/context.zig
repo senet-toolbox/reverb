@@ -1736,8 +1736,15 @@ pub fn getCookie(self: *Self, cookie_name: []const u8) ?Cookie {
     return null;
 }
 
+/// Looks up a query-string parameter by name.
+///
+/// Only the entries written for this request are scanned: the backing
+/// slice is allocated once and reused, so everything past
+/// `req_query_params_index` is left over from an earlier request or never
+/// initialised at all, and comparing against it would read garbage
+/// pointers.
 pub fn queryParam(self: *Self, name: []const u8) ?Param {
-    for (self.query_params) |param_elem| {
+    for (self.query_params[0..self.req_query_params_index]) |param_elem| {
         if (std.mem.eql(u8, param_elem.name, name)) {
             return param_elem;
         }
@@ -1746,8 +1753,12 @@ pub fn queryParam(self: *Self, name: []const u8) ?Param {
     return null;
 }
 
+/// Looks up a path parameter by name — the `:id` in `/users/:id`.
+///
+/// Bounded to the entries written for this request, for the same reason as
+/// `queryParam`.
 pub fn param(self: *Self, name: []const u8) ?Param {
-    for (self.params) |param_elem| {
+    for (self.params[0..self.req_params_index]) |param_elem| {
         if (std.mem.eql(u8, param_elem.name, name)) {
             return param_elem;
         }

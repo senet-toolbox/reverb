@@ -53,6 +53,10 @@ pub fn Server(comptime Config: type) type {
         context_pool: Abstractions.ManagedMemoryPool(Context),
         context_slots: []*Context,
         request_buffers: []RequestBuffer,
+        /// Registered route paths per method, reported by
+        /// `/metrics/allroutes`. Allocated from this server's arena, so it
+        /// has to live on the instance — see `Metrics.EndPoints`.
+        end_points: EndPoints = .{},
 
         // ctx: *Context = undefined,
 
@@ -124,9 +128,17 @@ pub fn Server(comptime Config: type) type {
             TRACE,
         };
 
+        /// Accumulates bytes for one connection until a whole request has
+        /// arrived.
+        ///
+        /// Loom applies no framing — a `process` call gets exactly what one
+        /// `read()` returned — so reassembly is Reverb's job. These are
+        /// indexed by `client.slot`, which loom guarantees is unique among
+        /// live connections, and a slot can be reused once its connection
+        /// closes; `socket` is what distinguishes the new occupant from the
+        /// old one.
         const RequestBuffer = struct {
             socket: ?posix.socket_t = null,
-            read_timeout: i64 = 0,
             data: ?[]u8 = null,
             len: usize = 0,
 
@@ -149,13 +161,15 @@ pub fn Server(comptime Config: type) type {
                 chunk: []const u8,
                 max_len: usize,
             ) !void {
-                if (self.socket == null or
-                    self.socket.? != client.socket or
-                    self.read_timeout != client.read_timeout)
-                {
+                // Only a different socket means a different connection has
+                // taken over this slot. `client.read_timeout` must not be
+                // part of this test: it is an idle deadline that loom
+                // refreshes on every read, so comparing it discarded the
+                // bytes buffered so far every time a request arrived in
+                // more than one packet.
+                if (self.socket == null or self.socket.? != client.socket) {
                     self.reset(allocator);
                     self.socket = client.socket;
-                    self.read_timeout = client.read_timeout;
                 }
 
                 if (chunk.len > max_len - self.len) return error.RequestTooLarge;
@@ -218,9 +232,9 @@ pub fn Server(comptime Config: type) type {
             }
             // Add the path to the appropriate endpoints array
             switch (method) {
-                .GET => try addToEndpoints(&Metrics.end_points.GET, route_path, reverb.arena),
-                .POST => try addToEndpoints(&Metrics.end_points.POST, route_path, reverb.arena),
-                .DELETE => try addToEndpoints(&Metrics.end_points.DELETE, route_path, reverb.arena),
+                .GET => try addToEndpoints(&reverb.end_points.GET, route_path, reverb.arena),
+                .POST => try addToEndpoints(&reverb.end_points.POST, route_path, reverb.arena),
+                .DELETE => try addToEndpoints(&reverb.end_points.DELETE, route_path, reverb.arena),
                 else => return error.CouldNotMatchMethod,
             }
             return;
@@ -251,7 +265,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.GET, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.GET, route_path, reverb.arena);
             return;
         }
 
@@ -303,7 +317,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.DELETE, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.DELETE, route_path, reverb.arena);
             return;
         }
 
@@ -332,7 +346,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.POST, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.POST, route_path, reverb.arena);
             return;
         }
 
@@ -361,7 +375,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.HEAD, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.HEAD, route_path, reverb.arena);
             return;
         }
 
@@ -390,7 +404,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.OPTIONS, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.OPTIONS, route_path, reverb.arena);
             return;
         }
 
@@ -419,7 +433,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.CONNECT, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.CONNECT, route_path, reverb.arena);
             return;
         }
 
@@ -448,7 +462,7 @@ pub fn Server(comptime Config: type) type {
                 route_path = path[0..end_colon];
             }
             // Add the path to the appropriate endpoints array
-            try addToEndpoints(&Metrics.end_points.TRACE, route_path, reverb.arena);
+            try addToEndpoints(&reverb.end_points.TRACE, route_path, reverb.arena);
             return;
         }
 
@@ -570,6 +584,17 @@ pub fn Server(comptime Config: type) type {
             if (param_args_op) |param_args| {
                 if (param_args.items.len > 0) {
                     for (param_args.items) |param| {
+                        // Path parameters are recorded in both places. They
+                        // belong in `params` — that is what `ctx.param()`
+                        // reads, and until now nothing populated it, so that
+                        // accessor could never return a value. They are also
+                        // still added to `query_params`, because that is
+                        // where they used to land and handlers may read them
+                        // through `ctx.queryParam()`.
+                        passed_ctx.addParam(param.param, param.value) catch |err| {
+                            try reverb.logger.err("AppendParam Error: {any}", .{err}, null);
+                            return error.AppendParam;
+                        };
                         passed_ctx.addQueryParam(param.param, param.value) catch |err| {
                             try reverb.logger.err("AppendQueryParam Error: {any}", .{err}, null);
                             return error.AppendQueryParam;
@@ -700,6 +725,10 @@ pub fn Server(comptime Config: type) type {
                 request_buffer.* = .{};
             }
 
+            // `getAllRoutes` is a plain handler with no path back to its
+            // server, so it reaches the endpoint lists through this pointer.
+            Metrics.active_end_points = &target.end_points;
+
             for (0..target.context_slots.len) |i| {
                 const ctx_op = try target.context_pool.create();
                 ctx_op.* = try Context.init(
@@ -717,6 +746,13 @@ pub fn Server(comptime Config: type) type {
         }
 
         pub fn deinit(self: *Reverb) void {
+            // Clear the signal handler's target first: once this instance is
+            // torn down, a late signal must not reach it.
+            if (signal_target == self) signal_target = null;
+            if (Metrics.active_end_points == &self.end_points) {
+                Metrics.active_end_points = null;
+            }
+
             for (&self.routes) |*radix| {
                 radix.deinit();
             }
@@ -725,19 +761,19 @@ pub fn Server(comptime Config: type) type {
             }
             self.arena.free(self.request_buffers);
             self.loom.deinit();
-            if (Metrics.end_points.GET) |ep_get| {
+            if (self.end_points.GET) |ep_get| {
                 for (ep_get) |elem| {
                     self.arena.free(elem);
                 }
                 self.arena.free(ep_get);
             }
-            if (Metrics.end_points.POST) |ep_post| {
+            if (self.end_points.POST) |ep_post| {
                 for (ep_post) |elem| {
                     self.arena.free(elem);
                 }
                 self.arena.free(ep_post);
             }
-            if (Metrics.end_points.PATCH) |ep_patch| {
+            if (self.end_points.PATCH) |ep_patch| {
                 for (ep_patch) |elem| {
                     self.arena.free(elem);
                 }
@@ -841,18 +877,99 @@ pub fn Server(comptime Config: type) type {
             return null;
         }
 
-        /// This function calls listen on the Reverb instance.
-        ///
-        /// # Returns:
-        /// !void.
-        pub fn listen(reverb: *Reverb) !void {
+        /// Applies configuration that has to be in place before the first
+        /// request is served. Idempotent, and called by both `listen` and
+        /// `bindListener`.
+        fn prepare(reverb: *Reverb) !void {
+            _ = reverb;
             if (use_cors) {
                 var str_builder = StringBuilder.new();
                 try cors.?.checkHeadersStr(&str_builder);
                 Context.cors_headers = str_builder.contents[str_builder.start..str_builder.len];
             }
+        }
 
-            try reverb.loom.listen();
+        /// Runs the event loop until `stop` is called.
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn listen(reverb: *Reverb) !void {
+            try reverb.prepare();
+            try reverb.loom.serve();
+        }
+
+        /// Binds and arms the listening socket without entering the event
+        /// loop.
+        ///
+        /// Split out from `listen` so a caller can read `boundPort` before
+        /// the loop takes over the thread — which is what makes
+        /// `port = 0` (an ephemeral, kernel-assigned port) usable, and what
+        /// lets a test bind first and connect without racing the server.
+        /// Idempotent.
+        pub fn bindListener(reverb: *Reverb) !void {
+            try reverb.prepare();
+            try reverb.loom.bindListener();
+        }
+
+        /// The port the listener actually bound to. Only meaningful after
+        /// `bindListener` or `listen`.
+        pub fn boundPort(reverb: *Reverb) !u16 {
+            return reverb.loom.boundPort();
+        }
+
+        /// The instance a received signal should stop.
+        ///
+        /// A signal handler cannot take arguments, so the target has to be
+        /// reachable from a global. Only one server per process can install
+        /// handlers; `installSignalHandlers` reports a conflict rather than
+        /// silently overwriting.
+        var signal_target: ?*Reverb = null;
+
+        fn handleShutdownSignal(_: c_int) callconv(.c) void {
+            // Only async-signal-safe work here: an atomic store and a write
+            // to the wake pipe, both of which `stop` is careful to keep safe.
+            if (signal_target) |target| target.stop();
+        }
+
+        /// Installs `SIGTERM` and `SIGINT` handlers that stop this server.
+        ///
+        /// Without this a container runtime's `SIGTERM` kills the process
+        /// outright, dropping in-flight responses; with it, `listen` returns
+        /// and the caller's `deinit` runs. `SIGPIPE` is also ignored, so a
+        /// client that disconnects mid-response surfaces as `EPIPE` on write
+        /// instead of killing the process.
+        pub fn installSignalHandlers(reverb: *Reverb) !void {
+            if (signal_target != null and signal_target != reverb) {
+                return error.SignalHandlersAlreadyInstalled;
+            }
+            signal_target = reverb;
+
+            var action = posix.Sigaction{
+                .handler = .{ .handler = handleShutdownSignal },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.TERM, &action, null);
+            posix.sigaction(posix.SIG.INT, &action, null);
+
+            var ignore = posix.Sigaction{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.PIPE, &ignore, null);
+        }
+
+        /// Asks the event loop to finish, so `listen` returns.
+        ///
+        /// Safe to call from another thread while the loop is blocked in
+        /// the poller, and safe to call from a signal handler: it only
+        /// stores an atomic flag and writes to the wake pipe. Also safe to
+        /// call before the loop starts, and more than once.
+        ///
+        /// In-flight connections are torn down by `deinit`, not here.
+        pub fn stop(reverb: *Reverb) void {
+            reverb.loom.stop();
         }
 
         pub fn handle(

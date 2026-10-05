@@ -24,7 +24,7 @@ const LogLevel = enum {
 
 pub fn init(target: *Logger) void {
     target.* = .{
-        .mutex = .{.state = .{ .raw = .unlocked }},
+        .mutex = .{ .state = .{ .raw = .unlocked } },
     };
 }
 

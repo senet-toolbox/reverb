@@ -4,7 +4,7 @@ const types = @import("types.zig");
 const fingerprint = @import("fingerprint.zig");
 const Crud = @import("../pg/crud.zig").CRUD;
 const ArrayList = std.array_list.Managed;
-const ColumnInfo =  @import("../pg/crud.zig").ColumnInfo;
+const ColumnInfo = @import("../pg/crud.zig").ColumnInfo;
 const Value = @import("../pg/crud.zig").Value;
 
 pub const ErrorStore = struct {
@@ -197,20 +197,24 @@ pub const ErrorStore = struct {
             \\    WHEN error_groups.status = 'ignored'  THEN 'ignored'
             \\    ELSE error_groups.status END
             \\RETURNING id
-        ) catch |err| { logPgError(conn, "upsertGroup"); self.pool.release(conn); return err; };
+        ) catch |err| {
+            logPgError(conn, "upsertGroup");
+            self.pool.release(conn);
+            return err;
+        };
 
-        try stmt.bind(@as([]const u8, fp));                          // $1  fingerprint
-        try stmt.bind(@as([]const u8, report.wasmError.type));       // $2  error_type
-        try stmt.bind(@as([]const u8, report.wasmError.message));    // $3  message
-        try stmt.bind(crash.function);                                // $4  crash_function
-        try stmt.bind(crash.file);                                    // $5  crash_file
-        try stmt.bind(crash.line);                                    // $6  crash_line
-        try stmt.bind(report.wasmError.is_wasm_trap);                // $7  is_wasm_trap
-        try stmt.bind(report.timestamp);                              // $8  first_seen
-        try stmt.bind(report.timestamp);                              // $9  last_seen
-        try stmt.bind(report.environment);                            // $10 environment
-        try stmt.bind(report.release);                                // $11 release
-        try stmt.bind(report.route);                                  // $12 route
+        try stmt.bind(@as([]const u8, fp)); // $1  fingerprint
+        try stmt.bind(@as([]const u8, report.wasmError.type)); // $2  error_type
+        try stmt.bind(@as([]const u8, report.wasmError.message)); // $3  message
+        try stmt.bind(crash.function); // $4  crash_function
+        try stmt.bind(crash.file); // $5  crash_file
+        try stmt.bind(crash.line); // $6  crash_line
+        try stmt.bind(report.wasmError.is_wasm_trap); // $7  is_wasm_trap
+        try stmt.bind(report.timestamp); // $8  first_seen
+        try stmt.bind(report.timestamp); // $9  last_seen
+        try stmt.bind(report.environment); // $10 environment
+        try stmt.bind(report.release); // $11 release
+        try stmt.bind(report.route); // $12 route
 
         var result = stmt.execute() catch |err| {
             logPgError(conn, "upsertGroup");
@@ -252,46 +256,50 @@ pub const ErrorStore = struct {
             \\  $22,$23,$24,$25,$26,
             \\  $27
             \\) RETURNING id
-        ) catch |err| { logPgError(conn, "insertReport"); self.pool.release(conn); return err; };
+        ) catch |err| {
+            logPgError(conn, "insertReport");
+            self.pool.release(conn);
+            return err;
+        };
 
-        try stmt.bind(@as([]const u8, report.element_id orelse ""));   // $1  error_id
-        try stmt.bind(@as([]const u8, report.wasmError.type));         // $2  error_type
-        try stmt.bind(@as([]const u8, report.wasmError.message));      // $3  message
-        try stmt.bind(report.wasmError.is_wasm_trap);                  // $4  is_wasm_trap
-        try stmt.bind(@as([]const u8, report.args orelse "{}"));       // $5  callback_args
-        try stmt.bind(@as(?[]const u8, null));                         // $6  element_type
-        try stmt.bind(report.timestamp);                                // $7  timestamp
-        try stmt.bind(crash.function);                                  // $8  crash_function
-        try stmt.bind(crash.file);                                      // $9  crash_file
-        try stmt.bind(crash.line);                                      // $10 crash_line
-        try stmt.bind(crash.column);                                    // $11 crash_column
-        try stmt.bind(crash.wasm_index);                                // $12 crash_wasm_index
-        try stmt.bind(crash.wasm_offset);                               // $13 crash_wasm_offset
-        try stmt.bind(crash.frame_type);                                // $14 crash_frame_type
-        try stmt.bind(report.route);                                    // $15 route
-        try stmt.bind(report.url);                                      // $16 url
-        try stmt.bind(report.session_id);                               // $17 session_id
-        try stmt.bind(report.user_agent);                               // $18 user_agent
-        try stmt.bind(report.environment);                              // $19 environment
-        try stmt.bind(report.release);                                  // $20 release
-        try stmt.bind(report.user_id);                                  // $21 user_id
+        try stmt.bind(@as([]const u8, report.element_id orelse "")); // $1  error_id
+        try stmt.bind(@as([]const u8, report.wasmError.type)); // $2  error_type
+        try stmt.bind(@as([]const u8, report.wasmError.message)); // $3  message
+        try stmt.bind(report.wasmError.is_wasm_trap); // $4  is_wasm_trap
+        try stmt.bind(@as([]const u8, report.args orelse "{}")); // $5  callback_args
+        try stmt.bind(@as(?[]const u8, null)); // $6  element_type
+        try stmt.bind(report.timestamp); // $7  timestamp
+        try stmt.bind(crash.function); // $8  crash_function
+        try stmt.bind(crash.file); // $9  crash_file
+        try stmt.bind(crash.line); // $10 crash_line
+        try stmt.bind(crash.column); // $11 crash_column
+        try stmt.bind(crash.wasm_index); // $12 crash_wasm_index
+        try stmt.bind(crash.wasm_offset); // $13 crash_wasm_offset
+        try stmt.bind(crash.frame_type); // $14 crash_frame_type
+        try stmt.bind(report.route); // $15 route
+        try stmt.bind(report.url); // $16 url
+        try stmt.bind(report.session_id); // $17 session_id
+        try stmt.bind(report.user_agent); // $18 user_agent
+        try stmt.bind(report.environment); // $19 environment
+        try stmt.bind(report.release); // $20 release
+        try stmt.bind(report.user_id); // $21 user_id
 
         // Request context (the fetch call that triggered the error, if any)
         if (report.request_context) |rc| {
-            try stmt.bind(@as(?[]const u8, rc.method));                // $22 request_method
-            try stmt.bind(@as(?[]const u8, rc.url));                   // $23 request_url
-            try stmt.bind(rc.status_code);                              // $24 request_status_code
-            try stmt.bind(rc.body);                                     // $25 request_body
-            try stmt.bind(rc.elapsed_ms);                               // $26 request_elapsed_ms
+            try stmt.bind(@as(?[]const u8, rc.method)); // $22 request_method
+            try stmt.bind(@as(?[]const u8, rc.url)); // $23 request_url
+            try stmt.bind(rc.status_code); // $24 request_status_code
+            try stmt.bind(rc.body); // $25 request_body
+            try stmt.bind(rc.elapsed_ms); // $26 request_elapsed_ms
         } else {
-            try stmt.bind(@as(?[]const u8, null));                     // $22
-            try stmt.bind(@as(?[]const u8, null));                     // $23
-            try stmt.bind(@as(?u32, null));                            // $24
-            try stmt.bind(@as(?[]const u8, null));                     // $25
-            try stmt.bind(@as(?i64, null));                            // $26
+            try stmt.bind(@as(?[]const u8, null)); // $22
+            try stmt.bind(@as(?[]const u8, null)); // $23
+            try stmt.bind(@as(?u32, null)); // $24
+            try stmt.bind(@as(?[]const u8, null)); // $25
+            try stmt.bind(@as(?i64, null)); // $26
         }
 
-        try stmt.bind(@as([]const u8, group_id));                      // $27 group_id
+        try stmt.bind(@as([]const u8, group_id)); // $27 group_id
 
         var result = stmt.execute() catch |err| {
             logPgError(conn, "insertReport");
@@ -317,7 +325,11 @@ pub const ErrorStore = struct {
             var stmt = conn.prepare(
                 \\INSERT INTO stack_frames (error_report_id,position,function_name,file,line,col,wasm_function_index,wasm_offset,frame_type)
                 \\VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            ) catch |err| { logPgError(conn, "insertFrames"); self.pool.release(conn); return err; };
+            ) catch |err| {
+                logPgError(conn, "insertFrames");
+                self.pool.release(conn);
+                return err;
+            };
             try stmt.bind(@as([]const u8, report_id));
             try stmt.bind(@as(i32, @intCast(i)));
             try stmt.bind(frame.function);
@@ -327,7 +339,11 @@ pub const ErrorStore = struct {
             try stmt.bind(if (frame.wasm_function_index) |w| @as(?i32, @intCast(w)) else null);
             try stmt.bind(frame.wasm_offset);
             try stmt.bind(@as([]const u8, @tagName(frame.frame_type)));
-            var result = stmt.execute() catch |err| { logPgError(conn, "insertFrames"); self.pool.release(conn); return err; };
+            var result = stmt.execute() catch |err| {
+                logPgError(conn, "insertFrames");
+                self.pool.release(conn);
+                return err;
+            };
             result.deinit();
             self.pool.release(conn);
         }
@@ -340,14 +356,22 @@ pub const ErrorStore = struct {
             var stmt = conn.prepare(
                 \\INSERT INTO trace_events (error_report_id,event_type,element_id,serialized_args,timestamp,delta_ms)
                 \\VALUES ($1,$2,$3,$4::jsonb,$5,$6)
-            ) catch |err| { logPgError(conn, "insertEvents"); self.pool.release(conn); return err; };
+            ) catch |err| {
+                logPgError(conn, "insertEvents");
+                self.pool.release(conn);
+                return err;
+            };
             try stmt.bind(@as([]const u8, report_id));
             try stmt.bind(@as([]const u8, @tagName(event.event_type)));
             try stmt.bind(event.element_id);
             try stmt.bind(@as([]const u8, event.serialized_args));
             try stmt.bind(event.timestamp);
             try stmt.bind(@as(i32, @intCast(@divTrunc(event.timestamp - report.timestamp, 1000))));
-            var result = stmt.execute() catch |err| { logPgError(conn, "insertEvents"); self.pool.release(conn); return err; };
+            var result = stmt.execute() catch |err| {
+                logPgError(conn, "insertEvents");
+                self.pool.release(conn);
+                return err;
+            };
             result.deinit();
             self.pool.release(conn);
         }

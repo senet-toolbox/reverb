@@ -149,6 +149,31 @@ pub fn init(target: *Radix, arena: std.mem.Allocator) !void {
     };
 }
 
+/// Releases every node in the tree.
+///
+/// `Server.deinit` calls this for each per-method tree. Route paths and the
+/// parameter lists produced during a search are owned by the allocator
+/// passed to `init`, so when that is an arena this is redundant — but the
+/// tree does not get to assume it was given one.
+pub fn deinit(radix: *Radix) void {
+    deinitNode(radix.allocator, radix.root);
+    radix.* = undefined;
+}
+
+fn deinitNode(allocator: std.mem.Allocator, node: *Node) void {
+    var children = node.children.valueIterator();
+    while (children.next()) |child| {
+        deinitNode(allocator, child.*);
+    }
+    node.children.deinit();
+
+    if (node.param_child) |param_child| {
+        deinitNode(allocator, param_child);
+    }
+
+    allocator.destroy(node);
+}
+
 fn newNode(
     radix: *Radix,
     prefix: []const u8,
@@ -408,7 +433,6 @@ fn printNode(node: *const Node, buffer: *std.array_list.Managed(u8), depth: usiz
 
     buffer.shrinkRetainingCapacity(original_len);
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

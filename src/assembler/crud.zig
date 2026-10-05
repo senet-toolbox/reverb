@@ -29,4 +29,3 @@ pub fn createTableAuth(pool: *pg.Pool) !void {
 
 // pub fn insertUser(pool: *pg.Pool) !void {
 // }
-

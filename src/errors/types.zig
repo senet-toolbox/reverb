@@ -129,4 +129,3 @@ pub const CrashFields = struct {
         };
     }
 };
-

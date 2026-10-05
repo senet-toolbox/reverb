@@ -66,5 +66,3 @@ pub fn deleteGroup(ctx: *Context) !void {
 pub fn deleteAllResolved(ctx: *Context) !void {
     return error_handlers.deleteAllResolved(ctx);
 }
-
-

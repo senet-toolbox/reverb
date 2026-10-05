@@ -63,7 +63,6 @@ pub fn add(query_builder: *QueryBuilder, key: []const u8, value: []const u8) !vo
     try query_builder.params.append(.{ .key = key_dup, .value = value_dup });
 }
 
-
 pub fn clear(query_builder: *QueryBuilder) void {
     query_builder.params.clearRetainingCapacity();
 }
