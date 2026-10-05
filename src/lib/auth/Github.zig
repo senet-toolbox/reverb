@@ -1,10 +1,8 @@
 const std = @import("std");
-const print = std.log.debug;
-const Context = @import("../context.zig");
 const QueryBuilder = @import("QueryBuilder.zig");
-const JWT = @import("../core/JWT.zig");
 const http = std.http;
 const json = std.json;
+const Client = http.Client;
 
 pub const User = struct {
     login: []const u8,
@@ -60,7 +58,7 @@ pub const User = struct {
 pub const Options = struct {
     client_id: []const u8,
     client_secret: []const u8,
-    redirect_uri: []const u8 = "http://localhost:5173/nightwatch/auth",
+    redirect_uri: []const u8 = "http://localhost:5173/auth",
     state: []const u8 = "random_csrf_token",
 };
 
@@ -68,16 +66,16 @@ pub const Provider = struct {
     const Self = @This();
     options: Options,
     query: QueryBuilder,
-    arena: *std.mem.Allocator,
+    arena: std.mem.Allocator,
     access_token: ?[]const u8 = null,
 
     pub fn init(
         target: *Provider,
         options: Options,
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
     ) !void {
         var query: QueryBuilder = undefined;
-        try query.init(allocator.*);
+        try query.init(allocator);
         target.* = .{
             .options = options,
             .query = query,
@@ -89,143 +87,135 @@ pub const Provider = struct {
     }
 
     pub fn tokenExchange(github_prov: *Self, auth_code: []const u8) ![]const u8 {
+        const allocator = github_prov.arena;
         try github_prov.query.add("client_id", github_prov.options.client_id);
         try github_prov.query.add("client_secret", github_prov.options.client_secret);
         try github_prov.query.add("code", auth_code);
         try github_prov.query.add("redirect_uri", github_prov.options.redirect_uri); // or your actual callback URL
         try github_prov.query.add("state", github_prov.options.state);
         defer github_prov.query.clear();
-        //
         try github_prov.query.queryStrEncode();
-        const full_url = try github_prov.query.generateUrl("https://github.com/login/oauth/access_token", github_prov.query.str);
-        defer github_prov.arena.free(full_url);
+        const payload = github_prov.query.str;
+        const uri = try std.Uri.parse("https://github.com/login/oauth/access_token");
 
-        const uri = try std.Uri.parse(full_url);
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
 
-        // Make the request
-        var buf: [4096]u8 = undefined;
-        var client = http.Client{ .allocator = github_prov.arena.* };
+        var client = Client{
+            .allocator = allocator,
+            .io = io,
+            .write_buffer_size = 8192,
+        };
+        defer client.deinit();
 
-        var req = try client.open(.POST, uri, http.Client.RequestOptions{
-            .server_header_buffer = &buf,
-            .headers = http.Client.Request.Headers{
-                .content_type = .{ .override = "application/json" },
+        var body = std.Io.Writer.Allocating.init(allocator);
+        const resp = try client.fetch(.{
+            .method = .POST,
+            .headers = .{
+                .content_type = .{ .override = "application/x-www-form-urlencoded" },
             },
+            .location = .{ .uri = uri },
+            .payload = payload,
+            .response_writer = &body.writer,
         });
 
-        req.transfer_encoding = .{ .content_length = 0 };
-        defer req.deinit();
-
-        _ = try req.send();
-        _ = try req.finish();
-        _ = try req.wait();
-
-        var rdr = req.reader();
-        const body = try rdr.readAllAlloc(github_prov.arena.*, 1024 * 1024 * 4);
-        // Check the HTTP return code
-        if (req.response.status != std.http.Status.ok) {
-            std.debug.print("\nBody: {s}\n", .{body});
-            std.debug.print("\nStatus: {any}\n", .{req.response.status});
-            std.debug.print("\nReason: {s}\n", .{req.response.reason});
+        if (resp.status != .ok) {
+            std.debug.print("\nBody: {s}\n", .{body.written()});
+            std.debug.print("\nStatus: {any}\n", .{resp.status});
 
             const ErrorStruct = struct {
                 @"error": []const u8,
                 error_description: []const u8,
             };
 
-            _ = try parseResp(ErrorStruct, body, github_prov.arena);
+            _ = parseResp(ErrorStruct, body.written(), allocator) catch {};
 
             return error.WrongStatusResponse;
         }
-        return body;
+        return body.written();
     }
 
     pub fn getUserInfo(github_prov: *Self, access_token: []const u8) ![]const u8 {
-        if (github_prov.access_token == null) return error.AccessTokenNull;
-        var allocator = std.heap.c_allocator;
+        const allocator = github_prov.arena;
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
         defer allocator.free(authorization);
         const uri = try std.Uri.parse("https://api.github.com/user");
-        // Make the request
-        var buf: [4096]u8 = undefined;
-        var client = http.Client{ .allocator = github_prov.arena.* };
 
-        var req = try client.open(.GET, uri, http.Client.RequestOptions{
-            .server_header_buffer = &buf,
-            .headers = http.Client.Request.Headers{
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+
+        var client = Client{
+            .allocator = allocator,
+            .io = io,
+            .write_buffer_size = 8192,
+        };
+        defer client.deinit();
+
+        var body = std.Io.Writer.Allocating.init(allocator);
+        const resp = try client.fetch(.{
+            .method = .GET,
+            .headers = .{
                 .authorization = .{ .override = authorization },
                 .user_agent = .{ .override = "Nightwatch" },
             },
+            .location = .{ .uri = uri },
+            .response_writer = &body.writer,
         });
 
-        defer req.deinit();
-
-        _ = try req.send();
-        _ = try req.finish();
-        _ = try req.wait();
-
-        var rdr = req.reader();
-        const body = try rdr.readAllAlloc(github_prov.arena.*, 1024 * 1024 * 4);
-        // Check the HTTP return code
-        if (req.response.status != std.http.Status.ok) {
-            std.debug.print("\nBody: {s}\n", .{body});
-            std.debug.print("\nStatus: {any}\n", .{req.response.status});
-            std.debug.print("\nReason: {s}\n", .{req.response.reason});
+        if (resp.status != .ok) {
+            std.debug.print("\nBody: {s}\n", .{body.written()});
+            std.debug.print("\nStatus: {any}\n", .{resp.status});
 
             const ErrorStruct = struct {
                 @"error": []const u8,
                 error_description: []const u8,
             };
 
-            _ = try parseResp(ErrorStruct, body, github_prov.arena);
+            _ = parseResp(ErrorStruct, body.written(), allocator) catch {};
 
             return error.WrongStatusResponse;
         }
-        return body;
+        return body.written();
     }
 
-    // Opening up a a http.Client.open cause slower compile time
     pub fn refreshToken(github_prov: *Self, refresh_token: []const u8) ![]const u8 {
+        const allocator = github_prov.arena;
         try github_prov.query.add("client_id", github_prov.options.client_id);
         try github_prov.query.add("client_secret", github_prov.options.client_secret);
         try github_prov.query.add("refresh_token", refresh_token); // or your actual callback URL
         try github_prov.query.add("redirect_uri", github_prov.options.redirect_uri); // or your actual callback URL
         try github_prov.query.add("state", github_prov.options.state);
         defer github_prov.query.clear();
-        //
-        // try github_prov.query.add("grant_type", github_prov.options.grant_type);
-        //
         try github_prov.query.queryStrEncode();
-        const full_url = try github_prov.query.generateUrl("https://oauth2.githubapis.com/token", github_prov.query.str);
-        defer github_prov.arena.free(full_url);
+        const payload = github_prov.query.str;
+        const uri = try std.Uri.parse("https://oauth2.githubapis.com/token");
 
-        const uri = try std.Uri.parse(full_url);
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
 
-        // Make the request
-        var buf: [4096]u8 = undefined;
-        var client = http.Client{ .allocator = github_prov.arena.* };
+        var client = Client{
+            .allocator = allocator,
+            .io = io,
+            .write_buffer_size = 8192,
+        };
+        defer client.deinit();
 
-        var req = try client.open(.POST, uri, http.Client.RequestOptions{
-            .server_header_buffer = &buf,
-            .headers = http.Client.Request.Headers{
-                .content_type = .{ .override = "application/json" },
+        var body = std.Io.Writer.Allocating.init(allocator);
+        const resp = try client.fetch(.{
+            .method = .POST,
+            .headers = .{
+                .content_type = .{ .override = "application/x-www-form-urlencoded" },
             },
+            .location = .{ .uri = uri },
+            .payload = payload,
+            .response_writer = &body.writer,
         });
-        defer req.deinit();
 
-        _ = try req.send();
-        _ = try req.finish();
-        _ = try req.wait();
-
-        var rdr = req.reader();
-        const body = try rdr.readAllAlloc(github_prov.arena.*, 1024 * 1024 * 4);
-
-        // Check the HTTP return code
-        if (req.response.status != std.http.Status.ok) {
+        if (resp.status != .ok) {
             return error.WrongStatusResponse;
         }
 
-        return body;
+        return body.written();
     }
 };
 
@@ -233,12 +223,12 @@ pub const TokenResp = struct {
     access_token: []const u8,
 };
 
-pub fn parseResp(comptime T: type, body: []const u8, allocator: *std.mem.Allocator) !*T {
+pub fn parseResp(comptime T: type, body: []const u8, allocator: std.mem.Allocator) !*T {
     const index = std.mem.indexOf(u8, body, "{").?;
     const binded_value: *T = try allocator.create(T);
     const parsed = json.parseFromSlice(
         T,
-        allocator.*,
+        allocator,
         body[index..body.len],
         .{},
     ) catch return error.MalformedJson;
@@ -247,5 +237,3 @@ pub fn parseResp(comptime T: type, body: []const u8, allocator: *std.mem.Allocat
     binded_value.* = parsed.value;
     return binded_value;
 }
-
-

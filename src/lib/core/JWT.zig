@@ -1,6 +1,5 @@
 const std = @import("std");
 const print = std.debug.print;
-const jwt_id = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjYzMzdiZTYzNjRmMzgyNDAwOGQwZTkwMDNmNTBiYjZiNDNkNWE5YzYiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiI4NjgwNjE0MzYyNjAtNGlybWd2Z2hxbTgxMDdpMjFpb2RyODhyOHV1MTBnNXUuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJhdWQiOiI4NjgwNjE0MzYyNjAtNGlybWd2Z2hxbTgxMDdpMjFpb2RyODhyOHV1MTBnNXUuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJzdWIiOiIxMDg2NDQ4Nzg3MDcwNDM3NjI5NDgiLCJlbWFpbCI6InYucm9reC5uZWxsZW1hbm5AZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF0X2hhc2giOiIzOXZpYkVJM0NfV3FYMmtFcmZ0UTBRIiwibmFtZSI6IlZpYy1BdWd1c3QgUm9reC1OZWxsZW1hbm4iLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSlJRZFhHOVd5UGNubDllZjdBSFhjUkZ0REFJLVNXWURGeXNySHNoZGtGaW9IeG45WT1zOTYtYyIsImdpdmVuX25hbWUiOiJWaWMtQXVndXN0IiwiZmFtaWx5X25hbWUiOiJSb2t4LU5lbGxlbWFubiIsImlhdCI6MTczNzQ5NjUwNywiZXhwIjoxNzM3NTAwMTA3fQ.SUiA-TxTAapA3BzEv68gBSUC0tZ_tatxcd-sHc9MA_A1n7XN1VRrW4kHmUA2o3vL9Fi3y6CjI9yaYKS6jhsYddesfKDwG_YGF1SKRNDMAF6ROs_ZIDnWVxzpu3wUl3MhOzDEPh2M1Wii0PnPVim5NaJFEhnuYSzJpRQI_2s_jMAs-QfTYXx0pG4vtJJaGYTloXwmsiKEXpT-F0fAPMBVFUaDLYM9SMy4ztrR2ZbupTIe1a7lG1T5nJlec5j3KdfQZWqV5wCZ_SNq79fzVbndB71sHfdwBoScqjJeFBGTrA_Y_GM2PIa2u-HduZviJ7Eki2n95IzUvYBj7GDZUfUDbg";
 
 pub const JWT2 = struct {
     header: []const u8,
@@ -44,7 +43,7 @@ pub const Payload = struct {
     exp: i64, // Expiration time (timestamp)
 };
 
-pub fn decodev2(token: []const u8, allocator: *std.mem.Allocator) !JWT2 {
+pub fn decodev2(token: []const u8, allocator: std.mem.Allocator) !JWT2 {
     var jwt_itr = std.mem.splitScalar(u8, token, '.');
 
     const header = jwt_itr.next().?;
@@ -90,9 +89,9 @@ pub fn decodev2(token: []const u8, allocator: *std.mem.Allocator) !JWT2 {
     //     std.debug.print("{x:0>2} ", .{byte});
     // }
 
-    const alloc_header = try std.fmt.allocPrint(allocator.*, "{s}", .{header_decoded[0..header_len]});
-    const alloc_payload = try std.fmt.allocPrint(allocator.*, "{s}", .{payload_decoded[0..payload_len]});
-    const alloc_signature = try std.fmt.allocPrint(allocator.*, "{s}", .{signature_decoded[0..signature_len]});
+    const alloc_header = try std.fmt.allocPrint(allocator, "{s}", .{header_decoded[0..header_len]});
+    const alloc_payload = try std.fmt.allocPrint(allocator, "{s}", .{payload_decoded[0..payload_len]});
+    const alloc_signature = try std.fmt.allocPrint(allocator, "{s}", .{signature_decoded[0..signature_len]});
 
     return JWT2{
         .header = alloc_header,
@@ -101,6 +100,7 @@ pub fn decodev2(token: []const u8, allocator: *std.mem.Allocator) !JWT2 {
     };
 }
 
+const Time = @import("loom").Time;
 const Algorithm = @import("root.zig").Algorithm;
 const HeaderRoot = @import("root.zig").Header;
 const Validation = @import("root.zig").Validation;
@@ -203,7 +203,7 @@ pub fn verify(
                     else => return error.InvalidDecodingKey,
                 });
                 @memcpy(&src, sig);
-                if (!std.crypto.utils.timingSafeEql([dest.len]u8, src, dest)) {
+                if (!std.crypto.timing_safe.eql([dest.len]u8, src, dest)) {
                     return error.InvalidSignature;
                 }
             },
@@ -215,7 +215,7 @@ pub fn verify(
                     else => return error.InvalidDecodingKey,
                 });
                 @memcpy(&src, sig);
-                if (!std.crypto.utils.timingSafeEql([dest.len]u8, src, dest)) {
+                if (!std.crypto.timing_safe.eql([dest.len]u8, src, dest)) {
                     return error.InvalidSignature;
                 }
             },
@@ -227,7 +227,7 @@ pub fn verify(
                     else => return error.InvalidDecodingKey,
                 });
                 @memcpy(&src, sig);
-                if (!std.crypto.utils.timingSafeEql([dest.len]u8, src, dest)) {
+                if (!std.crypto.timing_safe.eql([dest.len]u8, src, dest)) {
                     return error.InvalidSignature;
                 }
             },
@@ -317,7 +317,12 @@ fn encodePart(
     part: anytype,
 ) ![]const u8 {
     const encoder = std.base64.url_safe_no_pad.Encoder;
-    const json = try std.json.stringifyAlloc(allocator, part, .{ .emit_null_optional_fields = false });
+    const fmt = std.json.fmt(part, .{ .emit_null_optional_fields = false });
+
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    try fmt.format(&writer.writer);
+
+    const json = try writer.toOwnedSlice();
     defer allocator.free(json);
     const enc = try allocator.alloc(u8, encoder.calcSize(json.len));
     _ = encoder.encode(enc, json);
@@ -412,7 +417,7 @@ pub fn encode(
     defer allocator.free(sig_enc);
     _ = encoder.encode(sig_enc, sig);
 
-    var buf = std.ArrayList(u8).init(allocator);
+    var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
     try buf.appendSlice(msg);
     try buf.append('.');
@@ -450,43 +455,220 @@ pub fn getRefreshPayload(payload_str: []const u8, allocator: std.mem.Allocator) 
     return payload.value;
 }
 
-// Example usage
-test "decode jwt" {
-    const token = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjYzMzdiZTYzNjRmMzgyNDAwOGQwZTkwMDNmNTBiYjZiNDNkNWE5YzYiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiI4NjgwNjE0MzYyNjAtNGlybWd2Z2hxbTgxMDdpMjFpb2RyODhyOHV1MTBnNXUuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJhdWQiOiI4NjgwNjE0MzYyNjAtNGlybWd2Z2hxbTgxMDdpMjFpb2RyODhyOHV1MTBnNXUuYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJzdWIiOiIxMDg2NDQ4Nzg3MDcwNDM3NjI5NDgiLCJlbWFpbCI6InYucm9reC5uZWxsZW1hbm5AZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF0X2hhc2giOiIzOXZpYkVJM0NfV3FYMmtFcmZ0UTBRIiwibmFtZSI6IlZpYy1BdWd1c3QgUm9reC1OZWxsZW1hbm4iLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSlJRZFhHOVd5UGNubDllZjdBSFhjUkZ0REFJLVNXWURGeXNySHNoZGtGaW9IeG45WT1zOTYtYyIsImdpdmVuX25hbWUiOiJWaWMtQXVndXN0IiwiZmFtaWx5X25hbWUiOiJSb2t4LU5lbGxlbWFubiIsImlhdCI6MTczNzQ5NjUwNywiZXhwIjoxNzM3NTAwMTA3fQ.SUiA-TxTAapA3BzEv68gBSUC0tZ_tatxcd-sHc9MA_A1n7XN1VRrW4kHmUA2o3vL9Fi3y6CjI9yaYKS6jhsYddesfKDwG_YGF1SKRNDMAF6ROs_ZIDnWVxzpu3wUl3MhOzDEPh2M1Wii0PnPVim5NaJFEhnuYSzJpRQI_2s_jMAs-QfTYXx0pG4vtJJaGYTloXwmsiKEXpT-F0fAPMBVFUaDLYM9SMy4ztrR2ZbupTIe1a7lG1T5nJlec5j3KdfQZWqV5wCZ_SNq79fzVbndB71sHfdwBoScqjJeFBGTrA_Y_GM2PIa2u-HduZviJ7Eki2n95IzUvYBj7GDZUfUDbg";
-    const jwt = try decode(token);
+pub const SessionClaims = struct {
+    sub: []const u8, // your user id
+    email: []const u8,
+    name: []const u8,
+    iat: i64,
+    exp: i64,
+};
 
-    // Initialize an allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+/// Signs a 7-day session token for `user_id`.
+///
+/// `secret` is the HMAC signing key and must come from the caller's
+/// configuration — anyone holding it can mint tokens for any user, so it
+/// belongs in an environment variable or secret store, never in source.
+pub fn createSessionToken(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    user_id: []const u8,
+    email: []const u8,
+    name: []const u8,
+) ![]const u8 {
+    if (secret.len == 0) return error.MissingSigningSecret;
 
-    // Parse the header
-    const header = try std.json.parseFromSlice(Header, allocator, jwt.header, .{});
-    defer header.deinit();
+    const now: i64 = @intCast(Time.timestamp());
 
-    // Parse the payload
-    const payload = try std.json.parseFromSlice(Payload, allocator, jwt.payload, .{});
-    defer payload.deinit();
+    const header = HeaderRoot{
+        .alg = .HS256,
+        .typ = "JWT",
+    };
 
-    // Print the parsed header
-    std.debug.print("Header:\n", .{});
-    std.debug.print("  alg: {s}\n", .{header.value.alg});
-    std.debug.print("  kid: {s}\n", .{header.value.kid});
-    std.debug.print("  typ: {s}\n", .{header.value.typ});
+    const claims = SessionClaims{
+        .sub = user_id,
+        .email = email,
+        .name = name,
+        .iat = now,
+        .exp = now + (60 * 60 * 24 * 7), // 7 days
+    };
 
-    // Print the parsed payload
-    std.debug.print("\nPayload:\n", .{});
-    std.debug.print("  iss: {s}\n", .{payload.value.iss});
-    std.debug.print("  azp: {s}\n", .{payload.value.azp});
-    std.debug.print("  aud: {s}\n", .{payload.value.aud});
-    std.debug.print("  sub: {s}\n", .{payload.value.sub});
-    std.debug.print("  email: {s}\n", .{payload.value.email});
-    std.debug.print("  email_verified: {}\n", .{payload.value.email_verified});
-    std.debug.print("  at_hash: {s}\n", .{payload.value.at_hash});
-    std.debug.print("  name: {s}\n", .{payload.value.name});
-    std.debug.print("  picture: {s}\n", .{payload.value.picture});
-    std.debug.print("  given_name: {s}\n", .{payload.value.given_name});
-    std.debug.print("  family_name: {s}\n", .{payload.value.family_name});
-    std.debug.print("  iat: {}\n", .{payload.value.iat});
-    std.debug.print("  exp: {}\n", .{payload.value.exp});
+    return try encode(
+        allocator,
+        header,
+        claims,
+        .{ .secret = secret },
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const test_secret = "test-signing-secret-not-used-anywhere-real";
+
+// A token is only useful if it round-trips, so this is the baseline: what
+// went in as claims must come back out.
+test "HS256 token round-trips through encode and decode" {
+    const allocator = testing.allocator;
+    const now: i64 = @intCast(Time.timestamp());
+
+    const claims = SessionClaims{
+        .sub = "user-123",
+        .email = "someone@example.com",
+        .name = "Test User",
+        .iat = now,
+        .exp = now + 3600,
+    };
+
+    const token = try encode(
+        allocator,
+        .{ .alg = .HS256, .typ = "JWT" },
+        claims,
+        .{ .secret = test_secret },
+    );
+    defer allocator.free(token);
+
+    var jwt = try decode(
+        allocator,
+        SessionClaims,
+        token,
+        .{ .secret = test_secret },
+        .{},
+    );
+    defer jwt.deinit();
+
+    try testing.expectEqual(Algorithm.HS256, jwt.header.alg);
+    try testing.expectEqualStrings(claims.sub, jwt.claims.sub);
+    try testing.expectEqualStrings(claims.email, jwt.claims.email);
+    try testing.expectEqualStrings(claims.name, jwt.claims.name);
+    try testing.expectEqual(claims.exp, jwt.claims.exp);
+}
+
+// The security property that matters most: a token signed with one key
+// must not verify under another.
+test "a token signed with a different secret is rejected" {
+    const allocator = testing.allocator;
+    const now: i64 = @intCast(Time.timestamp());
+
+    const token = try encode(
+        allocator,
+        .{ .alg = .HS256, .typ = "JWT" },
+        SessionClaims{
+            .sub = "user-123",
+            .email = "someone@example.com",
+            .name = "Test User",
+            .iat = now,
+            .exp = now + 3600,
+        },
+        .{ .secret = "the-real-secret" },
+    );
+    defer allocator.free(token);
+
+    try testing.expectError(error.InvalidSignature, decode(
+        allocator,
+        SessionClaims,
+        token,
+        .{ .secret = "an-attackers-guess" },
+        .{},
+    ));
+}
+
+// Flipping a byte of the payload must invalidate the signature, otherwise
+// claims are attacker-controlled.
+test "a tampered payload is rejected" {
+    const allocator = testing.allocator;
+    const now: i64 = @intCast(Time.timestamp());
+
+    const token = try encode(
+        allocator,
+        .{ .alg = .HS256, .typ = "JWT" },
+        SessionClaims{
+            .sub = "user-123",
+            .email = "someone@example.com",
+            .name = "Test User",
+            .iat = now,
+            .exp = now + 3600,
+        },
+        .{ .secret = test_secret },
+    );
+    defer allocator.free(token);
+
+    const tampered = try allocator.dupe(u8, token);
+    defer allocator.free(tampered);
+
+    // Mutate a character inside the payload segment, leaving the structure
+    // intact so the failure comes from verification and not from parsing.
+    const first_dot = std.mem.indexOfScalar(u8, tampered, '.').?;
+    const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
+    const target = first_dot + (last_dot - first_dot) / 2;
+    tampered[target] = if (tampered[target] == 'A') 'B' else 'A';
+
+    try testing.expectError(error.InvalidSignature, decode(
+        allocator,
+        SessionClaims,
+        tampered,
+        .{ .secret = test_secret },
+        .{},
+    ));
+}
+
+test "an expired token is rejected" {
+    const allocator = testing.allocator;
+    const now: i64 = @intCast(Time.timestamp());
+
+    // Well outside the default 60s leeway.
+    const token = try encode(
+        allocator,
+        .{ .alg = .HS256, .typ = "JWT" },
+        SessionClaims{
+            .sub = "user-123",
+            .email = "someone@example.com",
+            .name = "Test User",
+            .iat = now - 7200,
+            .exp = now - 3600,
+        },
+        .{ .secret = test_secret },
+    );
+    defer allocator.free(token);
+
+    try testing.expectError(error.TokenExpired, decode(
+        allocator,
+        SessionClaims,
+        token,
+        .{ .secret = test_secret },
+        .{},
+    ));
+}
+
+test "malformed tokens are rejected rather than parsed" {
+    const allocator = testing.allocator;
+
+    for ([_][]const u8{
+        "",
+        "not-a-jwt",
+        "only.two",
+        "....",
+        "a.b.c.d",
+    }) |bad| {
+        try testing.expectError(error.MalformedJWT, decode(
+            allocator,
+            SessionClaims,
+            bad,
+            .{ .secret = test_secret },
+            .{},
+        ));
+    }
+}
+
+test "createSessionToken refuses an empty signing secret" {
+    try testing.expectError(error.MissingSigningSecret, createSessionToken(
+        testing.allocator,
+        "",
+        "user-123",
+        "someone@example.com",
+        "Test User",
+    ));
 }

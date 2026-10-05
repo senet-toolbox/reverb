@@ -2,7 +2,7 @@
 const std = @import("std");
 
 pub const Logger = @This();
-mutex: std.Thread.Mutex,
+mutex: std.Io.Mutex,
 
 const LogLevel = enum {
     DEBUG,
@@ -24,33 +24,33 @@ const LogLevel = enum {
 
 pub fn init(target: *Logger) void {
     target.* = .{
-        .mutex = .{},
+        .mutex = .{.state = .{ .raw = .unlocked }},
     };
 }
 
 fn log(
-    logger: *Logger,
+    _: *Logger,
     log_level: LogLevel,
     comptime fmt: []const u8,
     args: anytype,
     _: ?std.builtin.SourceLocation,
-    ret_addr: usize,
+    _: usize,
 ) !void {
-    const debug_info = try std.debug.getSelfDebugInfo();
-    var buf: [512]u8 = undefined;
-    var stream = std.Io.Writer.fixed(&buf);
-    const writer = &stream;
-    const tty = std.io.tty.detectConfig(std.fs.File.stderr());
-    try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
-    // 4) Grab only the bytes that were written
-    const outSlice = buf[0..stream.end];
-    const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
-    const src = buf[start..stream.end];
-    var sections = std.mem.splitScalar(u8, src, ':');
-    const file_name = sections.next() orelse return;
-    const line = sections.next() orelse return;
-    logger.mutex.lock();
-    defer logger.mutex.unlock();
+    // const debug_info = try std.debug.getSelfDebugInfo();
+    // var buf: [512]u8 = undefined;
+    // var stream = std.Io.Writer.fixed(&buf);
+    // const writer = &stream;
+    // const tty = std.io.tty.detectConfig(std.fs.File.stderr());
+    // try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
+    // // 4) Grab only the bytes that were written
+    // const outSlice = buf[0..stream.end];
+    // const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
+    // const src = buf[start..stream.end];
+    // var sections = std.mem.splitScalar(u8, src, ':');
+    // const file_name = sections.next() orelse return;
+    // const line = sections.next() orelse return;
+    // logger.mutex.lock();
+    // defer logger.mutex.unlock();
     // const stderr = std.io.getStdErr().writer();
     var errbuf: [512]u8 = undefined;
     var errstream = std.Io.Writer.fixed(&errbuf);
@@ -59,7 +59,7 @@ fn log(
     nosuspend try stderr.print("[{d}] ", .{std.time.timestamp()});
     nosuspend try stderr.print("[{s}{s}\x1b[0m] ", .{ log_level.color(), @tagName(log_level) });
     // if (opt_src) |src| {
-    nosuspend try stderr.print("[{s}:{s}] => ", .{ file_name, line });
+    // nosuspend try stderr.print("[{s}:{s}] => ", .{ file_name, line });
     // }
     nosuspend try stderr.print(fmt, args);
     nosuspend try stderr.writeByte('\n');

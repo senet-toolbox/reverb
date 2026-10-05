@@ -4,21 +4,23 @@
 //       \
 //        v - e
 const std = @import("std");
-const print = std.debug.print;
+// const print = std.debug.print;
 const mem = std.mem;
+
+fn print(comptime fmt: []const u8, args: anytype) void {
+    _ = fmt;
+    _ = args;
+    // std.debug.print(fmt, args);
+}
+
+// const HandlerFunc = *const fn ([]const u8) void;
+// const MiddleFunc = *const fn (HandlerFunc, []const u8) HandlerFunc;
+
 const Context = @import("../context.zig");
 const Ctx_pm = @import("../handler.zig").Ctx_pm;
 
 const HandlerFunc = *const fn (*Context) anyerror!void;
 const MiddleFunc = *const fn (HandlerFunc, *Context) anyerror!HandlerFunc;
-
-// const HandlerFunc = *const fn ([]const u8) void;
-// const MiddleFunc = *const fn (HandlerFunc, []const u8) HandlerFunc;
-
-const RadixError = error{
-    FailedToInitRadix,
-    FailedToCreateNode,
-};
 
 const RouteFunc = struct {
     handler_func: HandlerFunc,
@@ -42,77 +44,21 @@ fn findCommonPrefix(a: []const u8, b: []const u8) usize {
     return i;
 }
 
-const V4 = @Vector(4, u8);
-const V8 = @Vector(8, u8);
-const V16 = @Vector(16, u8);
-const V32 = @Vector(32, u8);
-const V64 = @Vector(64, u8);
-const V128 = @Vector(128, u8);
-
-/// Finds the length of the common prefix of two slices using SIMD instructions.
-pub fn findCommonPrefixSIMD(a: []const u8, b: []const u8) usize {
-    // We can only compare up to the length of the shorter slice.
-    const len = @min(a.len, b.len);
-    var i: usize = 0;
-
-    // First, process the slices in 32-byte (256-bit) chunks.
-    // This loop is most effective on architectures with AVX2 support.
-    while (i + 32 <= len) : (i += 32) {
-        // Load 32 bytes from each slice. Slicing and then using @bitCast on the
-        // resulting array value is safer than @ptrCast as it avoids memory alignment issues.
-        const vec_a: V32 = @bitCast((a[i..][0..32].*));
-        const vec_b: V32 = @bitCast((b[i..][0..32].*));
-
-        // Perform a parallel comparison of all 32 bytes.
-        // The result 'mask' is a vector of booleans (0 for mismatch, 0xFF for match).
-        const mask = vec_a == vec_b;
-
-        // Cast the boolean mask to a 256-bit integer representation to check all at once.
-        const bits: u32 = @bitCast(mask);
-
-        // If 'bits' is not completely full of 1s, there was a mismatch in this chunk.
-        if (bits != 0) {
-            return i + @ctz(bits);
-        }
-    }
-
-    // After the 32-byte loop, there might be a 16-byte chunk remaining.
-    if (i + 16 <= len) {
-        const vec_a: V16 = @bitCast(a[i..][0..16].*);
-        const vec_b: V16 = @bitCast(b[i..][0..16].*);
-        const mask = vec_a == vec_b;
-        const bits: u16 = @bitCast(mask);
-
-        if (bits != 0) {
-            return i + @ctz(bits);
-        }
-        i += 16;
-    }
-
-    while (i < len and a[i] == b[i]) : (i += 1) {}
-
-    return i;
-}
-
-// Alternative version using bit operations for potentially better performance
 pub fn findCommonPrefixSIMDOptimized(a: []const u8, b: []const u8) usize {
     const len = @min(a.len, b.len);
     var i: usize = 0;
 
-    // Process 8-byte chunks using u64 comparison (often fastest for smaller vectors)
     while (i + 8 <= len) : (i += 8) {
         const a_chunk = std.mem.readInt(u64, a[i..][0..8], .little);
         const b_chunk = std.mem.readInt(u64, b[i..][0..8], .little);
 
         if (a_chunk != b_chunk) {
-            // Find the first differing byte using XOR and trailing zeros
             const diff = a_chunk ^ b_chunk;
             const byte_offset = @ctz(diff) / 8;
             return i + byte_offset;
         }
     }
 
-    // Process 4-byte chunks
     while (i + 4 <= len) : (i += 4) {
         const a_chunk = std.mem.readInt(u32, a[i..][0..4], .little);
         const b_chunk = std.mem.readInt(u32, b[i..][0..4], .little);
@@ -124,7 +70,6 @@ pub fn findCommonPrefixSIMDOptimized(a: []const u8, b: []const u8) usize {
         }
     }
 
-    // Handle remaining bytes with scalar comparison
     while (i < len and a[i] == b[i]) : (i += 1) {}
 
     return i;
@@ -155,68 +100,53 @@ pub const Node = struct {
         return best_match;
     }
 
-    // hello is the node and i is 4 since we passed hell
     fn splitNode(
         self: *Node,
         at: usize,
         allocator: std.mem.Allocator,
     ) !*Node {
-        // We take the current node and set it as the child,
-        // so now we move everything from current to child
-        // current = handleUsers -> child = handleUsers while now current = handlerUser
-        // since we split the node
-        // we create a new node of o
         const new_node = try allocator.create(Node);
         new_node.* = Node{
             .prefix = self.prefix[at..],
             .value = self.value,
             .query_param = self.query_param,
-            .is_dynamic = self.is_end,
+            .is_dynamic = self.is_dynamic,
             .children = self.children,
             .param_child = self.param_child,
-            .is_end = true,
+            .is_end = self.is_end,
         };
 
-        // set the current node to hell
         self.prefix = self.prefix[0..at];
         self.children = std.StringHashMap(*Node).init(allocator);
-        // store the new_node o in the hell node
         try self.children.put(new_node.prefix, new_node);
+        self.value = null;
+        self.is_end = false;
+        self.param_child = null;
+        self.query_param = "";
 
         return new_node;
     }
 };
 
-pub fn init(target: *Radix, arena: *std.mem.Allocator) !void {
-    const root_node = try arena.*.create(Node);
+const V32 = @Vector(32, u8);
+const V64 = @Vector(64, u8);
+const V128 = @Vector(128, u8);
+
+pub fn init(target: *Radix, arena: std.mem.Allocator) !void {
+    const root_node = try arena.create(Node);
     root_node.* = Node{
         .prefix = "",
         .value = null,
         .query_param = "",
         .is_dynamic = false,
-        .children = std.StringHashMap(*Node).init(arena.*),
+        .children = std.StringHashMap(*Node).init(arena),
         .param_child = null,
         .is_end = false,
     };
     target.* = .{
         .root = root_node,
-        .allocator = arena.*,
+        .allocator = arena,
     };
-}
-
-pub fn deinit(radix: *Radix) void {
-    radix.recurseDestroy(radix.root);
-    radix.root.children.deinit();
-    radix.allocator.destroy(radix.root);
-}
-
-fn recurseDestroy(radix: *Radix, node: *Node) void {
-    var children_itr = node.children.iterator();
-    while (children_itr.next()) |child| {
-        radix.recurseDestroy(child.value_ptr.*);
-        child.value_ptr.*.children.deinit();
-        radix.allocator.destroy(child.value_ptr.*);
-    }
 }
 
 fn newNode(
@@ -228,7 +158,7 @@ fn newNode(
 ) !*Node {
     const node = try radix.allocator.create(Node);
     node.* = Node{
-        .prefix = prefix, // Initialize the prefix field
+        .prefix = prefix,
         .value = value,
         .query_param = query_param,
         .is_dynamic = false,
@@ -239,62 +169,14 @@ fn newNode(
     return node;
 }
 
-fn findSegmentEndIdx(path: []const u8) usize {
-    var idx: usize = 0;
-    while (idx < path.len and path[idx] != '/') : (idx += 1) {
-        if (path[idx] == 0) return idx;
-    }
-    return idx;
-}
-
 pub fn findNeedle(slice: []const u8, needle: u8) usize {
-    const splt_128: V128 = @splat(@as(u8, needle));
-    const splt_64: V64 = @splat(@as(u8, needle));
-    const splt_32: V32 = @splat(@as(u8, needle));
-
-    var i: usize = 0;
-    if (slice.len >= 128) {
-        while (i + 128 <= slice.len) : (i += 128) {
-            const v = slice[i..][0..128].*;
-            const vec: V128 = @bitCast(v);
-            const mask = vec == splt_128;
-            const bits: u128 = @bitCast(mask);
-            if (bits != 0) {
-                return i + @ctz(bits);
-            }
-        }
-    }
-    if (slice.len >= 64) {
-        while (i + 64 <= slice.len) : (i += 64) {
-            const v = slice[i..][0..64].*;
-            const vec: V64 = @bitCast(v);
-            const mask = vec == splt_64;
-            const bits: u64 = @bitCast(mask);
-            if (bits != 0) {
-                return i + @ctz(bits);
-            }
-        }
-    }
-    if (slice.len >= 32) {
-        while (i + 32 <= slice.len) : (i += 32) {
-            const v = slice[i..][0..32].*;
-            const vec: V32 = @bitCast(v);
-            const mask = vec == splt_32;
-            const bits: u32 = @bitCast(mask);
-            if (bits != 0) {
-                return i + @ctz(bits);
-            }
-        }
-    }
-
-    var j: usize = i;
+    var j: usize = 0;
     while (j < slice.len) : (j += 1) {
         if (slice[j] == needle) return j;
     }
     return slice.len;
 }
 
-// /api/test
 pub fn searchRoute(radix: *const Radix, path: []const u8) !?RouteHandler {
     if (radix.universal_mode) {
         return RouteHandler{
@@ -313,59 +195,66 @@ pub fn searchRoute(radix: *const Radix, path: []const u8) !?RouteHandler {
         }
     }
 
-    // Manually parse path segments to avoid iterator overhead
     while (start < path.len) : (start += 1) {
         if (path[start] == '/') continue;
         if (path[start] == ' ') break;
         if (path[start] == 0) break;
-        // api/test
-        // Skip leading slashes
         if (start >= path.len) break;
         const end = findNeedle(path[start..], '/') + start;
         const segment = path[start..end];
         start = end;
 
-        var remaining = segment;
-        while (remaining.len > 0) {
-            // We need to check this
-            const match = node.findChildWithCommonPrefix(remaining) orelse break;
-            const common_len = findCommonPrefixSIMDOptimized(match.prefix, remaining);
+        print("  [search] segment='{s}', node.prefix='{s}', node.is_end={}, node.children.count()={}, has_param_child={}\n", .{
+            segment,
+            node.prefix,
+            node.is_end,
+            node.children.count(),
+            node.param_child != null,
+        });
 
-            if (common_len != match.prefix.len) return null;
+        var remaining = segment;
+        var matched_fully = true;
+        while (remaining.len > 0) {
+            const match = node.findChildWithCommonPrefix(remaining) orelse {
+                print("    [search] no child with common prefix for remaining='{s}'\n", .{remaining});
+                matched_fully = false;
+                break;
+            };
+            const common_len = findCommonPrefixSIMDOptimized(match.prefix, remaining);
+            print("    [search] found child prefix='{s}', common_len={}, match.prefix.len={}\n", .{ match.prefix, common_len, match.prefix.len });
+            if (common_len != match.prefix.len) {
+                print("    [search] partial match only, returning null\n", .{});
+                return null;
+            }
             remaining = remaining[common_len..];
             node = match;
         }
 
-        // Handle dynamic parameters
-        if (node.param_child) |dynamic_child| {
-            // Look ahead for next segment
-            var param_start = start;
-            while (param_start < path.len and path[param_start] == '/') : (param_start += 1) {}
-            if (param_start >= path.len) break;
-
-            const param_end = std.mem.indexOfScalarPos(u8, path, param_start, '/') orelse path.len;
-            const param_value = path[param_start..param_end];
-            start = param_end + 1;
-
-            // Lazy initialization of param_args
-            if (param_args == null) {
-                param_args = try radix.allocator.create(std.array_list.Managed(ParamInfo));
-                param_args.?.* = std.array_list.Managed(ParamInfo).init(radix.allocator);
+        if (!matched_fully) {
+            if (node.param_child) |dynamic_child| {
+                print("    [search] falling back to dynamic child, query_param='{s}'\n", .{dynamic_child.query_param});
+                if (param_args == null) {
+                    param_args = try radix.allocator.create(std.array_list.Managed(ParamInfo));
+                    param_args.?.* = std.array_list.Managed(ParamInfo).init(radix.allocator);
+                }
+                try param_args.?.append(.{
+                    .param = dynamic_child.query_param,
+                    .value = segment,
+                });
+                node = dynamic_child;
+            } else {
+                print("    [search] no param child, returning null\n", .{});
+                return null;
             }
-
-            try param_args.?.append(.{
-                .param = dynamic_child.query_param,
-                .value = param_value,
-            });
-            node = dynamic_child;
         }
     }
+
+    print("  [search] final node: prefix='{s}', is_end={}, has_value={}\n", .{ node.prefix, node.is_end, node.value != null });
 
     if (node.is_end) {
         if (param_args == null) {
             return RouteHandler{
                 .route_func = node.value,
-                // .param_args = &args,
             };
         }
         return RouteHandler{
@@ -422,42 +311,40 @@ fn insert(
         const is_dynamic = segment[0] == ':';
         if (is_dynamic) {
             const param = segment[1..];
-
-            if (node.param_child) |_| return error.ConflictDynamicRoute;
-            // check the current node hello startwith hell
-            const dynamic_node = try radix.newNode(":dynamic", route_func, param, true);
-            node.param_child = dynamic_node;
-            return;
+            print("  [insert] dynamic segment ':{s}' on node prefix='{s}'\n", .{ param, node.prefix });
+            if (node.param_child == null) {
+                node.param_child = try radix.newNode(":dynamic", null, param, false);
+            }
+            node = node.param_child.?;
+            continue;
         }
 
-        // Inside the insertion loop:
+        print("  [insert] static segment '{s}' on node prefix='{s}'\n", .{ segment, node.prefix });
+
         while (segement_remaining.len > 0) {
-            // hell is common with hello, hell
-            // this finds is there is a child with hell prefix
             const matching_child = node.findChildWithCommonPrefix(segement_remaining);
             if (matching_child) |child| {
                 var i: usize = 0;
-                // The word_remingin is hello
-                // Find length of common prefix which is hell for hello which is 4
                 while (i < child.prefix.len and i < segement_remaining.len and child.prefix[i] == segement_remaining[i]) : (i += 1) {}
 
+                print("    [insert] found matching child prefix='{s}', common={}, remaining='{s}'\n", .{ child.prefix, i, segement_remaining });
+
                 if (i < child.prefix.len) {
+                    print("    [insert] SPLITTING node at {}: '{s}' -> '{s}' + '{s}'\n", .{ i, child.prefix, child.prefix[0..i], child.prefix[i..] });
+                    print("    [insert] before split: child.param_child={}, child.is_end={}, child.children.count()={}\n", .{ child.param_child != null, child.is_end, child.children.count() });
                     _ = try child.splitNode(i, radix.allocator);
-                    // Once we splitt the node we need to set the current to the correct route func
-                    child.value = route_func;
+                    print("    [insert] after split: child.prefix='{s}', child.param_child={}, child.is_end={}, child.children.count()={}\n", .{ child.prefix, child.param_child != null, child.is_end, child.children.count() });
+                    // Don't set value or clear param_child on intermediate splits
                     child.prefix = segement_remaining[0..i];
-                    child.param_child = null;
+                    child.value = null;
+                    child.is_end = false;
                     node = child;
-                    // Focus on the PARENT (the split node, now "hell")
                 } else {
                     node = child;
                 }
-                // Advance the word remianing
                 segement_remaining = segement_remaining[i..];
             } else {
-                // const param = if (is_dynamic) segment[1..] else "";
-                // create a new RouteFunc
-                // check the current node hello startwith hell
+                print("    [insert] no matching child, creating new node for '{s}'\n", .{segement_remaining});
                 const new_node = try radix.newNode(
                     segement_remaining,
                     route_func,
@@ -470,87 +357,181 @@ fn insert(
             }
         }
     }
+    node.value = route_func;
     node.is_end = true;
 }
 
 fn printTree(radix: *const Radix) !void {
     var buffer = std.array_list.Managed(u8).init(radix.allocator);
     defer buffer.deinit();
-    // Start traversal from the root's children (root itself has no prefix)
-    try printNode(radix.root, &buffer);
+    try printNode(radix.root, &buffer, 0);
 }
 
-fn printNode(node: *const Node, buffer: *std.array_list.Managed(u8)) !void {
-    // Save current buffer length to backtrack later
+fn printNode(node: *const Node, buffer: *std.array_list.Managed(u8), depth: usize) !void {
     const original_len = buffer.items.len;
-
-    // Append this node's prefix to the buffer
     try buffer.appendSlice(node.prefix);
 
-    // print("\n{s}", .{node.prefix});
-    // If this node marks the end of a word, print the accumulated buffer
+    // Print indented tree structure
+    var indent_buf: [256]u8 = undefined;
+    var indent_len: usize = 0;
+    for (0..depth) |_| {
+        indent_buf[indent_len] = ' ';
+        indent_buf[indent_len + 1] = ' ';
+        indent_len += 2;
+    }
+    const indent = indent_buf[0..indent_len];
+
+    print("{s}Node: prefix='{s}' is_end={} has_value={} has_param_child={} children={}\n", .{
+        indent,
+        node.prefix,
+        node.is_end,
+        node.value != null,
+        node.param_child != null,
+        node.children.count(),
+    });
+
     if (node.is_end) {
-        print("{s}\n", .{buffer.items});
+        print("{s}  -> full path: '{s}'\n", .{ indent, buffer.items });
     }
 
-    // Recursively process all children
     var children_itr = node.children.iterator();
     while (children_itr.next()) |child| {
-        try printNode(child.value_ptr.*, buffer);
+        try printNode(child.value_ptr.*, buffer, depth + 1);
     }
 
     if (node.param_child) |child| {
-        if (child.is_end) {
-            try buffer.appendSlice(child.prefix);
-            print("{s}\n", .{buffer.items});
-        }
+        try buffer.appendSlice("/:param");
+        print("{s}  [param_child]:\n", .{indent});
+        try printNode(child, buffer, depth + 1);
+        buffer.shrinkRetainingCapacity(buffer.items.len - 7);
     }
 
-    // Backtrack: remove this node's prefix to prepare for sibling paths
     buffer.shrinkRetainingCapacity(original_len);
 }
 
-fn handlePosts(path: []const u8) void {
-    std.debug.print("\nPost request: {s} \n", .{path});
-}
-fn handlePostsDynamic(path: []const u8) void {
-    std.debug.print("\nDynamic route: {s} \n", .{path});
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Route handlers exist only to give each route a distinct, identifiable
+/// function pointer — the tests compare against these directly rather than
+/// merely asserting that *some* handler was found.
+fn handleUpdateGroupStatus(_: *Context) anyerror!void {}
+fn handleGetErrorGroups(_: *Context) anyerror!void {}
+fn handleGetErrors(_: *Context) anyerror!void {}
+
+/// Asserts the search resolved to exactly `expected`, not just to something.
+fn expectHandler(result: ?RouteHandler, expected: HandlerFunc) !void {
+    const found = result orelse return error.RouteNotFound;
+    const route_func = found.route_func orelse return error.RouteHasNoHandler;
+    try testing.expectEqual(expected, route_func.handler_func);
 }
 
-fn handleUsers(path: []const u8) void {
-    std.debug.print("\nUsers: {s} \n", .{path});
-}
-fn handleUser(path: []const u8) void {
-    std.debug.print("\nUser: {s} \n", .{path});
-}
-
-fn handleIds(path: []const u8) void {
-    std.debug.print("\nIds: {s} \n", .{path});
-}
-
-test "radix tree insert" {
-    var radix: Radix = undefined;
-    var allocator = std.heap.page_allocator;
-    try radix.init(&allocator);
-    // hell has children o and scape
-    // try radix.addRoute("/users/posts/:name", handlePostsByName, &[_]MiddleFunc{});
-    // try radix.addRoute("/users/posts/:id", handlePostsByName, &[_]MiddleFunc{});
-    // Check if the order of dynamic and static matter !!!!!!!
-    try radix.addRoute("/users", handleUsers, &[_]MiddleFunc{});
-    try radix.addRoute("/users/:id", handlePostsDynamic, &[_]MiddleFunc{});
-    try radix.addRoute("/user", handleUser, &[_]MiddleFunc{});
-    // try radix.addRoute("/ap", handlePostsDynamic, &[_]MiddleFunc{});
-    // try radix.addRoute("/apple", handlePosts, &[_]MiddleFunc{});
-    // try radix.addRoute("/app/users", handleUsers, &[_]MiddleFunc{});
-    // try radix.addRoute("/users/posts/:ids", handlePostsDynamic, &[_]MiddleFunc{});
-    // try radix.addRoute("/users/posts", handlePostsDynamic, &[_]MiddleFunc{});
-    const route = try radix.searchRoute("/users");
-    if (route) |r| {
-        r.route_func.?.handler_func("DDD");
-        // print("\n{s}", .{r.param_args.*.items[0].value});
+fn expectParam(result: ?RouteHandler, name: []const u8, value: []const u8) !void {
+    const found = result orelse return error.RouteNotFound;
+    const args = found.param_args orelse return error.RouteHasNoParams;
+    for (args.items) |arg| {
+        if (std.mem.eql(u8, arg.param, name)) {
+            try testing.expectEqualStrings(value, arg.value);
+            return;
+        }
     }
-    // try radix.printTree();
-    // print("\n", .{});
-    // try radix.insert("hat");
-    // try radix.insert("have");
+    return error.ParamNotFound;
+}
+
+test "a parameterised route and its prefix coexist in one tree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var radix: Radix = undefined;
+    try Radix.init(&radix, arena.allocator());
+
+    // Inserting "/errors/groups" second must not clobber the longer route
+    // that already shares its prefix.
+    try radix.addRoute("/errors/groups/:id/status", handleUpdateGroupStatus, &[_]MiddleFunc{});
+    try radix.addRoute("/errors/groups", handleGetErrorGroups, &[_]MiddleFunc{});
+
+    const parameterised = try radix.searchRoute("/errors/groups/some-uuid/status");
+    try expectHandler(parameterised, handleUpdateGroupStatus);
+    try expectParam(parameterised, "id", "some-uuid");
+
+    try expectHandler(try radix.searchRoute("/errors/groups"), handleGetErrorGroups);
+}
+
+test "a parameterised route resolves as the only route in a tree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var radix: Radix = undefined;
+    try Radix.init(&radix, arena.allocator());
+    try radix.addRoute("/errors/groups/:id/status", handleUpdateGroupStatus, &[_]MiddleFunc{});
+
+    const result = try radix.searchRoute("/errors/groups/some-uuid/status");
+    try expectHandler(result, handleUpdateGroupStatus);
+    try expectParam(result, "id", "some-uuid");
+}
+
+test "separate per-method trees stay independent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // The server keeps one tree per HTTP method, so a route registered for
+    // POST must not become reachable through the GET tree.
+    var post_radix: Radix = undefined;
+    try Radix.init(&post_radix, arena.allocator());
+    var get_radix: Radix = undefined;
+    try Radix.init(&get_radix, arena.allocator());
+
+    try post_radix.addRoute("/errors/groups/:id/status", handleUpdateGroupStatus, &[_]MiddleFunc{});
+    try get_radix.addRoute("/errors/groups", handleGetErrorGroups, &[_]MiddleFunc{});
+
+    try expectHandler(
+        try post_radix.searchRoute("/errors/groups/some-uuid/status"),
+        handleUpdateGroupStatus,
+    );
+    try expectHandler(try get_radix.searchRoute("/errors/groups"), handleGetErrorGroups);
+
+    // The cross-tree lookups must miss.
+    try testing.expectEqual(
+        @as(?RouteHandler, null),
+        get_radix.searchRoute("/errors/groups/some-uuid/status") catch null,
+    );
+}
+
+test "sibling routes sharing a prefix each resolve to their own handler" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var radix: Radix = undefined;
+    try Radix.init(&radix, arena.allocator());
+
+    try radix.addRoute("/errors", handleGetErrors, &[_]MiddleFunc{});
+    try radix.addRoute("/errors/groups", handleGetErrorGroups, &[_]MiddleFunc{});
+    try radix.addRoute("/errors/groups/:id/status", handleUpdateGroupStatus, &[_]MiddleFunc{});
+
+    try expectHandler(try radix.searchRoute("/errors"), handleGetErrors);
+    try expectHandler(try radix.searchRoute("/errors/groups"), handleGetErrorGroups);
+    try expectHandler(
+        try radix.searchRoute("/errors/groups/abc/status"),
+        handleUpdateGroupStatus,
+    );
+}
+
+test "unregistered routes do not resolve" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var radix: Radix = undefined;
+    try Radix.init(&radix, arena.allocator());
+    try radix.addRoute("/errors/groups", handleGetErrorGroups, &[_]MiddleFunc{});
+
+    for ([_][]const u8{ "/", "/nope", "/errors", "/errors/groupsss" }) |path| {
+        const result = radix.searchRoute(path) catch continue;
+        if (result) |found| {
+            try testing.expect(found.route_func == null);
+        }
+    }
 }

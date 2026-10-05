@@ -29,8 +29,7 @@ pub fn peek(self: *Self) !u8 {
 
 test "Peek function test" {
     const req = "peek";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
     var c = try parser.peek();
     try testing.expect(c == 'p');
@@ -56,8 +55,7 @@ fn pop(self: *Self) !u8 {
 
 test "Pop function test" {
     const req = "peek";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
     var c = try parser.pop();
     try testing.expect(c == 'p');
@@ -99,8 +97,7 @@ fn parseAndConsumeLengthPrefix(self: *Self) !usize {
 
 test "ParseAndConsumeLengthPrefix function test" {
     const req = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
     // Pop the type off the string;
     var c = try parser.pop();
@@ -168,8 +165,7 @@ pub fn parseReq(self: *Self) ParserError!RESP {
 
 test "ParseReq function test" {
     var req: []const u8 = ":-232\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
     var resp = try parser.parseReq();
     try testing.expectEqualDeep(RESP{ .int = -232 }, resp);
@@ -177,6 +173,7 @@ test "ParseReq function test" {
     req = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
     parser = Self{ .input = req, .allocator = &allocator };
     resp = try parser.parseReq();
+    defer resp.deinit(allocator);
     var resp_arr = [_]RESP{ RESP{ .string = "hello" }, RESP{ .string = "world" } };
     try testing.expectEqualDeep(RESP{ .array = .{
         .values = &resp_arr,
@@ -215,9 +212,18 @@ fn parseArray(self: *Self) ParserError!RESP {
         },
     };
 
+    // A truncated element leaves the elements already parsed unreachable,
+    // so unwind them rather than leaking on malformed input.
+    var filled: usize = 0;
+    errdefer {
+        for (arr.array.values[0..filled]) |*value| value.deinit(self.allocator.*);
+        self.allocator.free(arr.array.values);
+    }
+
     for (0..len) |i| {
         const value = try self.parseReq();
         arr.array.values[i] = value;
+        filled = i + 1;
     }
 
     return arr;
@@ -235,15 +241,20 @@ fn parseSimpleString(self: *Self) ParserError!RESP {
     _ = try self.pop();
     _ = try self.pop();
 
-    return RESP{ .string = simple_str };
+    // Copied rather than borrowed from `input`, so that every `.string` a
+    // parse produces has the same ownership and `RESP.deinit` can free it
+    // unconditionally. Borrowing here would also outlive the request buffer.
+    const owned = try self.allocator.alloc(u8, simple_str.len);
+    @memcpy(owned, simple_str);
+    return RESP{ .string = owned };
 }
 
 test "ParseReq simple string test" {
     const req: []const u8 = "+NIMBUS\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
-    const resp = try parser.parseReq();
+    var resp = try parser.parseReq();
+    defer resp.deinit(allocator);
     try testing.expectEqualDeep(RESP{ .string = "NIMBUS" }, resp);
 }
 
@@ -273,10 +284,9 @@ fn parseBulkString(self: *Self) ParserError!RESP {
 
 test "parse array bulk string" {
     const req = "*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer if (gpa.deinit() != .ok) @panic("Memmory leak...");
-    var allocator = gpa.allocator();
-    const resp = try Self.parse(req, &allocator);
+    var allocator = std.testing.allocator;
+    var resp = try Self.parse(req, &allocator);
+    defer resp.deinit(allocator);
     try testing.expectEqualDeep(resp.toCommand(), Command{ .echo = "hey" });
 }
 
@@ -325,10 +335,9 @@ test "parse array json string" {
         .{ json.len, json },
     );
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer if (gpa.deinit() != .ok) @panic("Memmory leak...");
-    var allocator = gpa.allocator();
-    const resp = try Self.parse(req, &allocator);
+    var allocator = std.testing.allocator;
+    var resp = try Self.parse(req, &allocator);
+    defer resp.deinit(allocator);
     try testing.expectEqualDeep(resp.toCommand(), Command{
         .json_set = .{
             .value = Types.RESP{ .json = json },
@@ -369,8 +378,7 @@ fn parseFloat(self: *Self) ParserError!RESP {
 
 test "ParseReq float test" {
     const req: []const u8 = ",2.32\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
     const resp = try parser.parseReq();
     try testing.expectEqualDeep(RESP{ .float = 2.32 }, resp);
@@ -390,8 +398,7 @@ fn parseBool(self: *Self) ParserError!RESP {
 
 test "ParseReq boolean test" {
     const req: []const u8 = "#t\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
     const resp = try parser.parseReq();
     try testing.expectEqualDeep(RESP{ .boolean = true }, resp);
@@ -402,18 +409,30 @@ fn parseMap(self: *Self) ParserError!RESP {
     // Remove the resp_type %
     _ = try self.pop();
     const len = try self.parseAndConsumeLengthPrefix();
+    // Scratch space holding the flat key/value run before it is folded into
+    // the map; freed on every path below, since the map takes the entries.
     const key_value_arr = try self.allocator.*.alloc(RESP, len * 2);
+    defer self.allocator.free(key_value_arr);
+
+    var filled: usize = 0;
+    errdefer for (key_value_arr[0..filled]) |*value| value.deinit(self.allocator.*);
+
     for (0..len * 2) |i| {
         key_value_arr[i] = try self.parseReq();
+        filled = i + 1;
     }
-    const map_ptr = try self.allocator.*.create(std.StringHashMap(RESP));
-    map_ptr.* = std.StringHashMap(RESP).init(self.allocator.*);
 
-    var idx: u16 = 0;
-    for (key_value_arr) |_| {
-        if (idx >= len * 2) break;
-        try map_ptr.*.put(key_value_arr[idx].string, key_value_arr[idx + 1]);
-        idx += 2;
+    const map_ptr = try self.allocator.*.create(std.StringHashMap(RESP));
+    errdefer self.allocator.destroy(map_ptr);
+    map_ptr.* = std.StringHashMap(RESP).init(self.allocator.*);
+    errdefer map_ptr.deinit();
+
+    var idx: usize = 0;
+    while (idx + 1 < key_value_arr.len) : (idx += 2) {
+        // Keys come off the wire, so the sender controls their type; a
+        // non-string key is a malformed request, not a wrong-tag access.
+        if (key_value_arr[idx] != .string) return ParserError.unexpected;
+        try map_ptr.put(key_value_arr[idx].string, key_value_arr[idx + 1]);
     }
 
     return RESP{ .map = map_ptr };
@@ -439,11 +458,12 @@ fn compareHashMapContent(
 
 test "ParseReq map test" {
     const req: []const u8 = "%2\r\n+first\r\n:+1\r\n+second\r\n:+2\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var allocator = std.testing.allocator;
     var parser = Self{ .input = req, .allocator = &allocator };
-    const resp = try parser.parseReq();
+    var resp = try parser.parseReq();
+    defer resp.deinit(allocator);
     var map = std.StringHashMap(RESP).init(allocator);
+    defer map.deinit();
     try map.put("first", RESP{ .int = 1 });
     try map.put("second", RESP{ .int = 2 });
     try std.testing.expect(try compareHashMapContent(&map, resp.map));
@@ -456,19 +476,17 @@ fn popTerminator(self: *Self) !void {
 
 test "parse bulk string array" {
     const req = "$4\r\necho\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer if (gpa.deinit() != .ok) @panic("Memmory leak...");
-    var allocator = gpa.allocator();
-    const resp = try Self.parse(req, &allocator);
+    var allocator = std.testing.allocator;
+    var resp = try Self.parse(req, &allocator);
+    defer resp.deinit(allocator);
     try testing.expectEqualDeep(resp, RESP{ .string = "echo" });
 }
 
 test "Parse bulk string array" {
     const req = "*6\r\n$3\r\nSET\r\n$3\r\nage\r\n:+12\r\n$3\r\nSET\r\n$4\r\nname\r\n+Vic\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer if (gpa.deinit() != .ok) @panic("Memmory leak...");
-    var allocator = gpa.allocator();
-    const resp = try Self.parse(req, &allocator);
+    var allocator = std.testing.allocator;
+    var resp = try Self.parse(req, &allocator);
+    defer resp.deinit(allocator);
     var arr_set = [_]RESP{
         RESP{ .string = "SET" },
         RESP{ .string = "age" },
@@ -479,15 +497,13 @@ test "Parse bulk string array" {
     };
     const expected_resp = RESP{ .array = .{ .values = &arr_set, .allocator = &allocator } };
     try testing.expectEqualDeep(resp, expected_resp);
-    std.debug.print("\n{any}", .{resp.toCommand()});
     try testing.expectEqualDeep(resp.toCommand(), expected_resp.toCommand());
 }
 
 test "parse and call command" {
     const req = "*2\r\n$4\r\nECHO\r\n$3\r\nVic\r\n";
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer if (gpa.deinit() != .ok) @panic("Memmory leak...");
-    var allocator = gpa.allocator();
-    const resp = try Self.parse(req, &allocator);
+    var allocator = std.testing.allocator;
+    var resp = try Self.parse(req, &allocator);
+    defer resp.deinit(allocator);
     try testing.expectEqualDeep(resp.toCommand(), Command{ .echo = "Vic" });
 }

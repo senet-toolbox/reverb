@@ -28,6 +28,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const pg = b.dependency("pg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // the executable from your call to b.addExecutable(...)
+
     const loom = b.dependency("loom", .{
         .target = target,
         .optimize = optimize,
@@ -50,25 +57,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "loom", .module = loom_mod },
         },
     });
-    //
-    // // Modules can depend on one another using the `std.Build.Module.addImport` function.
-    // // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
-    // // file path. In this case, we set up `exe_mod` to import `lib_mod`.
-    // exe_mod.addImport("reverb_lib", lib_mod);
-    //
-    // // Now, we will create a static library based on the module we created above.
-    // // This creates a `std.Build.Step.Compile`, which is the build step responsible
-    // // for actually invoking the compiler.
-    // const lib = b.addLibrary(.{
-    //     .linkage = .static,
-    //     .name = "reverb",
-    //     .root_module = lib_mod,
-    // });
-    //
-    // // This declares intent for the library to be installed into the standard
-    // // location when the user invokes the "install" step (the default step when
-    // // running `zig build`).
-    //
+
+    exe_mod.addImport("pg", pg.module("pg"));
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
     const exe = b.addExecutable(.{
@@ -104,4 +94,89 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `run` step rather than the default, which is "install".
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    // ------------------------------------------------------------------
+    // Tests.
+    //
+    // Zig only collects `test` blocks from the *root* file of a test
+    // binary, so every file carrying tests has to be reachable through an
+    // explicit `_ = @import(...)` from the root. `src/root.zig` does that
+    // for the unit tests; `tests/integration.zig` drives a real server
+    // over real sockets.
+    // ------------------------------------------------------------------
+    const unit_tests = b.addTest(.{
+        .name = "unit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "loom", .module = loom_mod },
+            },
+        }),
+    });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    run_unit_tests.has_side_effects = true;
+
+    const integration_tests = b.addTest(.{
+        .name = "integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "reverb", .module = mod },
+                .{ .name = "loom", .module = loom_mod },
+            },
+        }),
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.has_side_effects = true;
+
+    const test_unit_step = b.step("test-unit", "Run unit tests");
+    test_unit_step.dependOn(&run_unit_tests.step);
+
+    const test_integration_step = b.step("test-integration", "Run integration tests");
+    test_integration_step.dependOn(&run_integration_tests.step);
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
+
+    // ------------------------------------------------------------------
+    // pg_orm module — exposes src/pg/orm.zig so examples (and any future
+    // consumer outside main.zig) can `@import("pg_orm")`.
+    // ------------------------------------------------------------------
+    const pg_orm_mod = b.addModule("pg_orm", .{
+        .root_source_file = b.path("src/pg/orm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pg_orm_mod.addImport("pg", pg.module("pg"));
+
+    // ------------------------------------------------------------------
+    // Example: orm_example — end-to-end ORM walk-through.
+    // Build/run with: `zig build orm-example`
+    // ------------------------------------------------------------------
+    const orm_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/orm_example.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pg", .module = pg.module("pg") },
+            .{ .name = "pg_orm", .module = pg_orm_mod },
+        },
+    });
+
+    const orm_example_exe = b.addExecutable(.{
+        .name = "orm_example",
+        .root_module = orm_example_mod,
+    });
+    b.installArtifact(orm_example_exe);
+
+    const run_orm_example = b.addRunArtifact(orm_example_exe);
+    run_orm_example.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_orm_example.addArgs(args);
+    const orm_example_step = b.step("orm-example", "Run the ORM example");
+    orm_example_step.dependOn(&run_orm_example.step);
 }

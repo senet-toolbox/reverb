@@ -41,8 +41,8 @@ pub fn init(target: *Metrics, tether: *Tether) void {
 
 fn allocateRoute(
     node: Radix.Node,
-    buffer: *std.ArrayList(u8),
-    all_routes: *std.ArrayList([]const u8),
+    buffer: *std.array_list.Managed(u8),
+    all_routes: *std.array_list.Managed([]const u8),
     allocator: *std.mem.Allocator,
 ) !void {
     // Save current buffer length to backtrack later
@@ -83,9 +83,9 @@ fn allocateRoute(
 pub fn mapRoutes(metrics: *Metrics) !void {
     const radix_itr = metrics.tether.routes;
     for (radix_itr, 0..) |route, idx| {
-        var all_routes = std.ArrayList([]const u8).init(metrics.tether.arena.*);
+        var all_routes = std.array_list.Managed([]const u8).init(metrics.tether.arena.*);
         const node = route.root.*;
-        var buffer = std.ArrayList(u8).init(metrics.tether.arena.*);
+        var buffer = std.array_list.Managed(u8).init(metrics.tether.arena.*);
         try allocateRoute(node, &buffer, &all_routes, metrics.tether.arena);
         const method_str = methods[idx];
         const method = std.meta.stringToEnum(Methods, method_str) orelse return error.Null;

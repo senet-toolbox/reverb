@@ -13,147 +13,196 @@ pub const RESP = union(enum) {
     boolean: bool,
     map: *std.StringHashMap(RESP),
 
+    /// Releases everything a parse allocated for this value, recursively.
+    ///
+    /// Only call this on values produced by the parser: those own their
+    /// strings and child values. Hand-built `RESP`s pointing at literals do
+    /// not, and freeing one is undefined behaviour.
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        switch (self.*) {
+            .array => |v| {
+                for (v.values) |*value| value.deinit(allocator);
+                allocator.free(v.values);
+            },
+            .string => |v| allocator.free(v),
+            .json => |v| allocator.free(v),
+            .map => |m| {
+                var it = m.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(allocator);
+                }
+                m.deinit();
+                allocator.destroy(m);
+            },
+            .int, .float, .boolean => {},
+        }
+        self.* = undefined;
+    }
+
+    /// Argument access helpers.
+    ///
+    /// A RESP array arrives straight off the wire, so neither its length
+    /// nor the type of any element can be assumed. Every argument goes
+    /// through these, which turn a malformed request into an error instead
+    /// of an out-of-bounds read or a wrong-tag union access.
+    const Args = struct {
+        values: []const RESP,
+
+        fn at(a: Args, i: usize) !RESP {
+            if (i >= a.values.len) return error.MissingArgument;
+            return a.values[i];
+        }
+
+        fn string(a: Args, i: usize) ![]const u8 {
+            const v = try a.at(i);
+            if (v != .string) return error.InvalidArgumentType;
+            return v.string;
+        }
+
+        fn int(a: Args, i: usize) !i32 {
+            const v = try a.at(i);
+            if (v != .int) return error.InvalidArgumentType;
+            return v.int;
+        }
+
+        /// Asserts the command carries at least `n` elements including the
+        /// verb itself.
+        fn arity(a: Args, n: usize) !void {
+            if (a.values.len < n) return error.WrongNumberOfArguments;
+        }
+    };
+
+    /// Interprets `self` as a command.
+    ///
+    /// The returned `Command` borrows the strings inside `self`; it does not
+    /// copy them and does not take ownership. The caller keeps responsibility
+    /// for freeing the parsed `RESP` and must keep it alive for as long as the
+    /// `Command` is in use.
     pub fn toCommand(self: Self) !?Command {
         return switch (self) {
             .array => |v| {
-                if (v.values.len == 1 and std.ascii.eqlIgnoreCase(v.values[0].string, "PING")) {
-                    defer v.allocator.free(v.values[0].string);
+                const args = Args{ .values = v.values };
+                const verb = args.string(0) catch return null;
+
+                if (std.ascii.eqlIgnoreCase(verb, "PING")) {
                     return Command{ .ping = {} };
                 }
-                if (v.values.len == 2 and std.ascii.eqlIgnoreCase(v.values[0].string, "ECHO")) {
-                    defer v.allocator.free(v.values[0].string);
-                    return Command{ .echo = v.values[1].string };
+                if (std.ascii.eqlIgnoreCase(verb, "ECHO")) {
+                    try args.arity(2);
+                    return Command{ .echo = try args.string(1) };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "SET")) {
-                    defer v.allocator.free(v.values[0].string);
+                if (std.ascii.eqlIgnoreCase(verb, "SET")) {
+                    try args.arity(3);
                     return Command{ .set = .{
-                        .key = v.values[1].string,
-                        .value = v.values[2],
+                        .key = try args.string(1),
+                        .value = try args.at(2),
                     } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "JSONSET")) {
-                    defer v.allocator.free(v.values[0].string);
+                if (std.ascii.eqlIgnoreCase(verb, "JSONSET")) {
+                    try args.arity(3);
                     return Command{ .json_set = .{
-                        .key = v.values[1].string,
-                        .value = v.values[2],
+                        .key = try args.string(1),
+                        .value = try args.at(2),
                     } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "JSONGET")) {
-                    defer v.allocator.free(v.values[0].string);
-                    return Command{ .json_get = .{
-                        .key = v.values[1].string,
-                    } };
+                if (std.ascii.eqlIgnoreCase(verb, "JSONGET")) {
+                    try args.arity(2);
+                    return Command{ .json_get = .{ .key = try args.string(1) } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "GET")) {
-                    defer v.allocator.free(v.values[0].string);
-                    return Command{ .get = .{
-                        .key = v.values[1].string,
-                    } };
+                if (std.ascii.eqlIgnoreCase(verb, "GET")) {
+                    try args.arity(2);
+                    return Command{ .get = .{ .key = try args.string(1) } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "DEL")) {
-                    defer v.allocator.free(v.values[0].string);
-                    return Command{ .del = .{
-                        .key = v.values[1].string,
-                    } };
+                if (std.ascii.eqlIgnoreCase(verb, "DEL")) {
+                    try args.arity(2);
+                    return Command{ .del = .{ .key = try args.string(1) } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "LPUSH")) {
-                    defer v.allocator.free(v.values[0].string);
+                if (std.ascii.eqlIgnoreCase(verb, "LPUSH")) {
+                    try args.arity(3);
                     return Command{ .lpush = .{
-                        .dll_name = v.values[1].string,
-                        .dll_new_value = v.values[2],
+                        .dll_name = try args.string(1),
+                        .dll_new_value = try args.at(2),
                     } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "LSET")) {
-                    defer v.allocator.free(v.values[0].string);
-                    const tag = std.meta.activeTag(v.values[2]);
-                    const len = v.values.len;
-                    const adj_len = v.values.len - 2;
-                    const arr_str = try self.array.allocator.alloc(RESP, adj_len);
+                if (std.ascii.eqlIgnoreCase(verb, "LSET")) {
+                    try args.arity(3);
+                    const tag = std.meta.activeTag(try args.at(2));
+                    const arr_str = try v.allocator.alloc(RESP, v.values.len - 2);
+                    errdefer v.allocator.free(arr_str);
 
-                    // We skip over the first 2 elements since it is the command and name of the list
-                    for (2..len) |i| {
-                        if (tag != std.meta.activeTag(v.values[i])) return error.AllValuesMustBeTheSameType;
-                        arr_str[i - 2] = v.values[i];
+                    // Skip the verb and the list name.
+                    for (v.values[2..], 0..) |value, i| {
+                        if (tag != std.meta.activeTag(value)) return error.AllValuesMustBeTheSameType;
+                        arr_str[i] = value;
                     }
 
                     return Command{ .lset = .{
-                        .dll_name = v.values[1].string,
+                        .dll_name = try args.string(1),
                         .dll_values = arr_str,
                         .tag = tag,
                     } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "LPUSHMANY")) {
-                    defer v.allocator.free(v.values[0].string);
-                    const tag = std.meta.activeTag(v.values[2]);
-                    const len = v.values.len;
-                    const adj_len = v.values.len - 2;
-                    const arr_str = try self.array.allocator.alloc(RESP, adj_len);
+                if (std.ascii.eqlIgnoreCase(verb, "LPUSHMANY")) {
+                    try args.arity(3);
+                    const tag = std.meta.activeTag(try args.at(2));
+                    const arr_str = try v.allocator.alloc(RESP, v.values.len - 2);
+                    errdefer v.allocator.free(arr_str);
 
-                    // We skip over the first 2 elements since it is the command and name of the list
-                    for (2..len) |i| {
-                        if (tag != std.meta.activeTag(v.values[i])) return error.AllValuesMustBeTheSameType;
-                        arr_str[i - 2] = v.values[i];
+                    // Skip the verb and the list name.
+                    for (v.values[2..], 0..) |value, i| {
+                        if (tag != std.meta.activeTag(value)) return error.AllValuesMustBeTheSameType;
+                        arr_str[i] = value;
                     }
 
                     return Command{ .lpushmany = .{
-                        .dll_name = v.values[1].string,
+                        .dll_name = try args.string(1),
                         .dll_values = arr_str,
                         .tag = tag,
                     } };
                 }
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "HSET")) {
-                    defer v.allocator.free(v.values[0].string);
-                    const len = v.values.len;
-                    const adj_len = v.values.len - 2;
-                    const arr_resp = try self.array.allocator.alloc(RESP, adj_len);
+                if (std.ascii.eqlIgnoreCase(verb, "HSET")) {
+                    try args.arity(3);
+                    const arr_resp = try v.allocator.alloc(RESP, v.values.len - 2);
+                    errdefer v.allocator.free(arr_resp);
 
-                    for (2..len) |i| {
-                        arr_resp[i - 2] = v.values[i];
+                    for (v.values[2..], 0..) |value, i| {
+                        arr_resp[i] = value;
                     }
 
                     return Command{ .hset = .{
-                        .map_name = v.values[1].string,
+                        .map_name = try args.string(1),
                         .map_values = arr_resp,
                     } };
                 }
-
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "HGET")) {
-                    defer v.allocator.free(v.values[0].string);
-                    if (v.values[1] != .string) return error.InvalidArgumentType;
-                    if (v.values[2] != .string) return error.InvalidArgumentType;
+                if (std.ascii.eqlIgnoreCase(verb, "HGET")) {
+                    try args.arity(3);
                     return Command{ .hget = .{
-                        .map_name = v.values[1].string,
-                        .key = v.values[2].string,
+                        .map_name = try args.string(1),
+                        .key = try args.string(2),
                     } };
                 }
-
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "LRANGE")) {
-                    defer v.allocator.free(v.values[0].string);
-                    if (v.values[2] != .int) return error.InvalidArgumentType;
-                    if (v.values[3] != .int) return error.InvalidArgumentType;
+                if (std.ascii.eqlIgnoreCase(verb, "LRANGE")) {
+                    try args.arity(4);
                     return Command{ .lrange = .{
-                        .dll_name = v.values[1].string,
-                        .start_index = v.values[2].int,
-                        .end_range = v.values[3].int,
+                        .dll_name = try args.string(1),
+                        .start_index = try args.int(2),
+                        .end_range = try args.int(3),
                     } };
                 }
-
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "SETELEM")) {
-                    defer v.allocator.free(v.values[0].string);
-                    if (v.values[2] != .int) return error.InvalidArgumentType;
+                if (std.ascii.eqlIgnoreCase(verb, "SETELEM")) {
+                    try args.arity(4);
                     return Command{ .set_elem = .{
-                        .dll_name = v.values[1].string,
-                        .index = v.values[2].int,
-                        .value = v.values[3],
+                        .dll_name = try args.string(1),
+                        .index = try args.int(2),
+                        .value = try args.at(3),
                     } };
                 }
-
-                if (std.ascii.eqlIgnoreCase(v.values[0].string, "DELELEM")) {
-                    defer v.allocator.free(v.values[0].string);
-                    if (v.values[2] != .int) return error.InvalidArgumentType;
+                if (std.ascii.eqlIgnoreCase(verb, "DELELEM")) {
+                    try args.arity(3);
                     return Command{ .del_elem = .{
-                        .dll_name = v.values[1].string,
-                        .index = v.values[2].int,
+                        .dll_name = try args.string(1),
+                        .index = try args.int(2),
                     } };
                 }
                 return null;
@@ -173,19 +222,19 @@ pub const RESP = union(enum) {
             // .dll => {
             //     return null;
             // },
-            .int => |_| {
+            .int =>  {
                 return null;
             },
-            .float => |_| {
+            .float => {
                 return null;
             },
-            .boolean => |_| {
+            .boolean => {
                 return null;
             },
-            .map => |_| {
+            .map => {
                 return null;
             },
-            .json => |_| {
+            .json => {
                 return null;
             },
         };
