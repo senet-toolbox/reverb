@@ -22,6 +22,7 @@ test {
     // Zig only collects `test` blocks from files reachable from the root of
     // the test binary, so every file carrying tests is named explicitly here.
     _ = @import("lib/helpers.zig");
+    _ = @import("lib/core/builders.zig");
     _ = @import("lib/parser.zig");
     _ = @import("lib/TrackingAllocator.zig");
     _ = @import("lib/Tripwire.zig");

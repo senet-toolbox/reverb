@@ -18,7 +18,15 @@ pub fn build(b: *std.Build) void {
     // This creates a "module", which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Every executable or library we compile will be based on one or more modules.
+    // Reverb reaches libc in a few places -- `std.heap.c_allocator` in
+    // treehouse.zig and context.zig, 29 call sites in total. Until those are
+    // converted to take an allocator, libc has to be declared.
+    //
+    // This was previously satisfied by accident: the pg dependency linked
+    // libc, so removing pg broke the Linux build while macOS kept working,
+    // because libSystem is linked there regardless. See context.md.
     const mod = b.addModule("reverb", .{
+        .link_libc = true,
         // `root_source_file` is the Zig "entry point" of the module. If a module
         // only contains e.g. external object files, you can make this `null`.
         // In this case the main source file is merely a path, however, in more
@@ -47,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "reverb", .module = mod },
             .{ .name = "loom", .module = loom_mod },
@@ -99,6 +108,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/readme_quickstart.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "reverb", .module = mod },
             },
@@ -122,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "loom", .module = loom_mod },
             },
@@ -136,6 +147,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/integration.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "reverb", .module = mod },
                 .{ .name = "loom", .module = loom_mod },

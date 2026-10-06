@@ -877,15 +877,25 @@ pub fn Server(comptime Config: type) type {
             return null;
         }
 
+        /// Backing store for the assembled CORS header block.
+        ///
+        /// `Context.cors_headers` is a global holding a slice of this, read
+        /// on every preflight for the life of the process, so the buffer
+        /// cannot be a local of `prepare`.
+        var cors_header_buffer: [4096]u8 = undefined;
+
         /// Applies configuration that has to be in place before the first
         /// request is served. Idempotent, and called by both `listen` and
         /// `bindListener`.
         fn prepare(reverb: *Reverb) !void {
             _ = reverb;
             if (use_cors) {
-                var str_builder = StringBuilder.new();
+                var str_builder = StringBuilder.new(&cors_header_buffer);
                 try cors.?.checkHeadersStr(&str_builder);
-                Context.cors_headers = str_builder.contents[str_builder.start..str_builder.len];
+                // Emitting a half-built CORS block would silently relax the
+                // policy the caller configured, so refuse to start instead.
+                if (str_builder.overflowed) return error.CorsHeadersTooLarge;
+                Context.cors_headers = str_builder.slice();
             }
         }
 

@@ -47,6 +47,33 @@ jobs:
       - name: README example still compiles
         run: zig build check-readme -Doptimize=${{ matrix.optimize }}
 
+  # Catches a platform-specific API or an undeclared libc dependency in
+  # shared code before it reaches somebody's machine. Compile only --
+  # these targets cannot be executed on the runner. A missing libc
+  # declaration broke the Linux build once while macOS kept working,
+  # because libSystem is linked there regardless.
+  cross-compile:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - aarch64-macos
+          - x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }}
+
   lint:
     name: formatting
     runs-on: ubuntu-latest
