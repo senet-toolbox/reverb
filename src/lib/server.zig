@@ -141,6 +141,9 @@ pub fn Server(comptime Config: type) type {
             socket: ?posix.socket_t = null,
             data: ?[]u8 = null,
             len: usize = 0,
+            /// Bytes at the front already served. Non-zero only while a
+            /// pipelined packet is being worked through.
+            consumed: usize = 0,
 
             fn reset(self: *RequestBuffer, allocator: Allocator) void {
                 if (self.data) |data| {
@@ -151,7 +154,33 @@ pub fn Server(comptime Config: type) type {
 
             fn bytes(self: *const RequestBuffer) []const u8 {
                 const data = self.data orelse return "";
-                return data[0..self.len];
+                return data[self.consumed..self.len];
+            }
+
+            /// Marks `n` bytes of the front of the buffer as served.
+            ///
+            /// Bytes are not moved here: a packet usually holds one request,
+            /// so the common case is to consume everything and reset the
+            /// offsets. `compact` handles the leftover case.
+            fn consume(self: *RequestBuffer, n: usize) void {
+                self.consumed += n;
+                if (self.consumed >= self.len) {
+                    // Everything served; start the next read at the front.
+                    self.consumed = 0;
+                    self.len = 0;
+                }
+            }
+
+            /// Moves any unserved tail to the front, so the next append has
+            /// room and the buffer does not grow without bound on a
+            /// long-lived pipelined connection.
+            fn compact(self: *RequestBuffer) void {
+                if (self.consumed == 0) return;
+                const data = self.data orelse return;
+                const remaining = self.len - self.consumed;
+                std.mem.copyForwards(u8, data[0..remaining], data[self.consumed..self.len]);
+                self.consumed = 0;
+                self.len = remaining;
             }
 
             fn append(
@@ -171,6 +200,11 @@ pub fn Server(comptime Config: type) type {
                     self.reset(allocator);
                     self.socket = client.socket;
                 }
+
+                // Reclaim any already-served prefix before measuring room,
+                // so a pipelined connection is not reported as full because
+                // of bytes that have already been answered.
+                self.compact();
 
                 if (chunk.len > max_len - self.len) return error.RequestTooLarge;
                 try self.ensureCapacity(allocator, self.len + chunk.len, max_len);
@@ -843,40 +877,6 @@ pub fn Server(comptime Config: type) type {
             try static_ctx.FILE(buf[0..bytes_read]);
         }
 
-        fn readCompleteHttpRequest(
-            reverb: *Reverb,
-            client: *Client,
-            recv_data: []const u8,
-            scratch: []u8,
-            used_request_buffer: *bool,
-        ) !?[]const u8 {
-            if (client.slot >= reverb.request_buffers.len) return error.ContextSlotOutOfRange;
-
-            const max_request_size = Reverb.MAX_RECV_SIZE + helpers.MAX_HEADER_SIZE;
-            const request_buffer = &reverb.request_buffers[client.slot];
-
-            if (request_buffer.len == 0) {
-                if (!helpers.isSupportedHttpMethodPrefix(recv_data)) return error.MalformedRequest;
-
-                if (try helpers.expectedHttpRequestLength(recv_data, Reverb.MAX_RECV_SIZE)) |request_len| {
-                    if (request_len <= scratch.len) {
-                        @memcpy(scratch[0..request_len], recv_data[0..request_len]);
-                        return scratch[0..request_len];
-                    }
-                }
-            }
-
-            try request_buffer.append(reverb.arena, client, recv_data, max_request_size);
-            used_request_buffer.* = true;
-
-            const buffered = request_buffer.bytes();
-            if (try helpers.expectedHttpRequestLength(buffered, Reverb.MAX_RECV_SIZE)) |request_len| {
-                return buffered[0..request_len];
-            }
-
-            return null;
-        }
-
         /// Backing store for the assembled CORS header block.
         ///
         /// `Context.cors_headers` is a global holding a slice of this, read
@@ -993,7 +993,6 @@ pub fn Server(comptime Config: type) type {
             var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
             const client = new_client;
             const recv_data = new_recv_data;
-            var ctx_pm = Ctx_pm{};
             if (recv_data.len == 0) {
                 // Browsers (or firefox?) attempt to optimize for speed
                 // by opening a connection to the server once a user highlights
@@ -1045,39 +1044,91 @@ pub fn Server(comptime Config: type) type {
                 return;
             }
 
-            var used_request_buffer = false;
-            const request_data = (readCompleteHttpRequest(
-                reverb,
-                client,
-                recv_data,
-                recv_buf[0..],
-                &used_request_buffer,
-            ) catch |err| {
-                if (client.slot < reverb.request_buffers.len) {
-                    reverb.request_buffers[client.slot].reset(reverb.arena);
-                }
+            if (client.slot >= reverb.request_buffers.len) return error.ContextSlotOutOfRange;
+            const request_buffer = &reverb.request_buffers[client.slot];
 
-                const resp = switch (err) {
-                    error.BodyTooLarge, error.RequestTooLarge => "HTTP/1.1 413 Request Entity Too Large\r\n" ++
-                        "Content-Type: text/html\r\n" ++
-                        "Content-Length: 0\r\n\r\n",
-                    error.HeaderTooLarge => "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
-                        "Content-Type: text/html\r\n" ++
-                        "Content-Length: 0\r\n\r\n",
-                    else => "HTTP/1.1 404 MALFORMED REQUEST\r\n" ++
-                        "Content-Type: text/html\r\n" ++
-                        "Content-Length: 0\r\n\r\n",
-                };
-
-                ctx.RAW(resp) catch |write_err| {
-                    return write_err;
-                };
+            // A single read can carry a fragment of one request, exactly
+            // one, or several pipelined back to back. Buffer the bytes, then
+            // serve every complete request they now contain; whatever is
+            // left over stays for the next read.
+            const max_request_size = Reverb.MAX_RECV_SIZE + helpers.MAX_HEADER_SIZE;
+            request_buffer.append(reverb.arena, client, recv_data, max_request_size) catch |err| {
+                request_buffer.reset(reverb.arena);
+                try respondToFramingError(ctx, err);
                 return err;
-            }) orelse return;
-            defer if (used_request_buffer) {
-                reverb.request_buffers[client.slot].reset(reverb.arena);
             };
 
+            while (true) {
+                const pending = request_buffer.bytes();
+                if (pending.len == 0) break;
+
+                if (!helpers.isSupportedHttpMethodPrefix(pending)) {
+                    request_buffer.reset(reverb.arena);
+                    try respondToFramingError(ctx, error.MalformedRequest);
+                    return error.MalformedRequest;
+                }
+
+                const request_len = helpers.expectedHttpRequestLength(
+                    pending,
+                    Reverb.MAX_RECV_SIZE,
+                ) catch |err| {
+                    request_buffer.reset(reverb.arena);
+                    try respondToFramingError(ctx, err);
+                    return err;
+                } orelse break; // Incomplete; wait for more bytes.
+
+                // Copied out before serving: a handler may write a response,
+                // and the write path can grow the same buffer underneath us.
+                if (request_len > recv_buf.len) {
+                    request_buffer.reset(reverb.arena);
+                    try respondToFramingError(ctx, error.RequestTooLarge);
+                    return error.RequestTooLarge;
+                }
+                @memcpy(recv_buf[0..request_len], pending[0..request_len]);
+                request_buffer.consume(request_len);
+
+                // Each pipelined request gets a clean context.
+                ctx.clear();
+                ctx.client = client;
+                try serveRequest(reverb, client, ctx, recv_buf[0..request_len]);
+            }
+
+            return;
+        }
+
+        /// Writes the status that corresponds to a framing failure.
+        fn respondToFramingError(ctx: *Context, err: anyerror) !void {
+            const resp = switch (err) {
+                error.BodyTooLarge, error.RequestTooLarge => "HTTP/1.1 413 Request Entity Too Large\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+                error.HeaderTooLarge => "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+                // Chunked bodies are not implemented. 411 tells the client
+                // to send a Content-Length instead of leaving it to guess.
+                error.UnsupportedTransferEncoding => "HTTP/1.1 411 Length Required\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n" ++
+                    "Connection: close\r\n\r\n",
+                else => "HTTP/1.1 400 Bad Request\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+            };
+            ctx.RAW(resp) catch |write_err| return write_err;
+        }
+
+        /// Parses and routes one complete request.
+        ///
+        /// `request_data` holds exactly one request, already framed by
+        /// `handle`.
+        fn serveRequest(
+            reverb: *Reverb,
+            client: *Client,
+            ctx: *Context,
+            request_data: []const u8,
+        ) !void {
+            var ctx_pm = Ctx_pm{};
             ctx.client.?.msg = request_data;
 
             // switching to a http_header inside ctx reduces by 10k req/s

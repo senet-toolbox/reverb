@@ -178,6 +178,36 @@ pub const Connection = struct {
         _ = system.close(c.fd);
     }
 
+    /// Reads until `count` complete responses have arrived, the peer
+    /// closes, or the read times out.
+    ///
+    /// Needed for pipelining, where one `write` produces several responses
+    /// on the same connection and stopping at the first would prove
+    /// nothing. Caller owns the returned memory.
+    pub fn readResponses(
+        c: *const Connection,
+        allocator: std.mem.Allocator,
+        count: usize,
+    ) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        var chunk: [4096]u8 = undefined;
+        while (countCompleteResponses(buf.items) < count) {
+            const rc = system.read(c.fd, &chunk, chunk.len);
+            const n: usize = switch (posix.errno(rc)) {
+                .SUCCESS => @intCast(rc),
+                .INTR => continue,
+                .AGAIN, .CONNRESET, .PIPE => break,
+                else => return error.RecvFailed,
+            };
+            if (n == 0) break; // peer closed
+            try buf.appendSlice(allocator, chunk[0..n]);
+        }
+
+        return buf.toOwnedSlice(allocator);
+    }
+
     pub fn setTimeouts(c: Connection, millis: i64) !void {
         const tv = std.c.timeval{
             .sec = @intCast(@divTrunc(millis, 1000)),
@@ -252,6 +282,33 @@ fn responseIsComplete(data: []const u8) bool {
     return true;
 }
 
+/// How many complete HTTP responses `data` holds.
+fn countCompleteResponses(data: []const u8) usize {
+    var count: usize = 0;
+    var rest = data;
+    while (nextResponseLen(rest)) |len| {
+        count += 1;
+        rest = rest[len..];
+    }
+    return count;
+}
+
+/// The length of the first complete response in `data`, or null if it is
+/// still incomplete.
+fn nextResponseLen(data: []const u8) ?usize {
+    const head_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
+    const head = data[0..head_end];
+    const body_start = head_end + 4;
+
+    const declared = if (findHeaderValue(head, "Content-Length")) |value|
+        std.fmt.parseInt(usize, value, 10) catch 0
+    else
+        0;
+
+    if (data.len - body_start < declared) return null;
+    return body_start + declared;
+}
+
 fn findHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     _ = lines.next(); // status line
@@ -262,6 +319,11 @@ fn findHeaderValue(head: []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// How many complete responses `data` holds. Exposed for tests.
+pub fn countResponses(data: []const u8) usize {
+    return countCompleteResponses(data);
 }
 
 /// Extracts the numeric status code from a response.

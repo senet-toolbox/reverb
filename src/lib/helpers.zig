@@ -273,6 +273,33 @@ fn parseHeaderContentLength(headers: []const u8) !usize {
     return 0;
 }
 
+/// True when the head declares a transfer coding this server cannot frame.
+///
+/// `identity` is excluded because it means "no encoding applied" and so
+/// leaves `Content-Length` in charge of framing.
+fn hasUnsupportedTransferEncoding(headers: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next(); // request line
+
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) continue;
+
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(value, "identity")) continue;
+        return true;
+    }
+
+    return false;
+}
+
+/// How many bytes make up the first complete request in `payload`, or null
+/// if it has not all arrived yet.
+///
+/// This is the only thing standing between one request's bytes and the
+/// next, so getting it wrong either stalls a connection or lets a body be
+/// read as a following request.
 pub fn expectedHttpRequestLength(payload: []const u8, max_body_size: usize) !?usize {
     const headers_end = findCRLFCRLF(payload) orelse {
         if (payload.len > MAX_HEADER_SIZE) return error.HeaderTooLarge;
@@ -280,6 +307,15 @@ pub fn expectedHttpRequestLength(payload: []const u8, max_body_size: usize) !?us
     };
     const header_len = headers_end + 4;
     if (header_len > MAX_HEADER_SIZE) return error.HeaderTooLarge;
+
+    // Refused rather than ignored. A chunked body framed as zero-length
+    // would leave the chunk data in the buffer to be parsed as the next
+    // request on a keep-alive connection — request smuggling. The same
+    // applies when both Transfer-Encoding and Content-Length are present,
+    // since two parties can then disagree about which one frames the body.
+    if (hasUnsupportedTransferEncoding(payload[0..headers_end])) {
+        return error.UnsupportedTransferEncoding;
+    }
 
     const content_length = try parseHeaderContentLength(payload[0..headers_end]);
     if (content_length > max_body_size) return error.BodyTooLarge;
@@ -1156,4 +1192,41 @@ test "expectedHttpRequestLength frames requests correctly" {
     );
     const giant = "GET / HTTP/1.1\r\n" ++ ("X-Pad: 0123456789\r\n" ** 1200);
     try testing.expectError(error.HeaderTooLarge, expectedHttpRequestLength(giant, max_body));
+}
+
+// `Transfer-Encoding` is not implemented, and the danger is not that it is
+// missing but that it is ignored: a chunked body would be framed as
+// zero-length, leaving the chunk data in the buffer to be read as the
+// *next* request on a keep-alive connection. That is request smuggling.
+// Both these cases must be refused.
+test "a chunked request is refused rather than mis-framed" {
+    const max_body = 1024;
+
+    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        max_body,
+    ));
+
+    // Header name casing is not significant.
+    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\ntransfer-encoding: CHUNKED\r\n\r\n0\r\n\r\n",
+        max_body,
+    ));
+
+    // `identity` is the one encoding that means "no encoding", so it is
+    // not a framing hazard and stays allowed.
+    const identity = "POST / HTTP/1.1\r\nTransfer-Encoding: identity\r\nContent-Length: 2\r\n\r\nhi";
+    try testing.expectEqual(
+        @as(?usize, identity.len),
+        try expectedHttpRequestLength(identity, max_body),
+    );
+}
+
+// Sending both headers is the classic smuggling setup: two intermediaries
+// disagree about which one frames the body.
+test "a request with both Transfer-Encoding and Content-Length is refused" {
+    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        1024,
+    ));
 }

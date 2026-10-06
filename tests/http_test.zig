@@ -295,3 +295,122 @@ test "the server shuts down cleanly on request" {
     // loop returned rather than having to be killed.
     h.stop();
 }
+
+// Two requests arriving in a single packet. Loom hands over one read's
+// worth of bytes, so after serving the first request Reverb has to notice
+// the second is already in hand rather than discarding it and waiting for
+// a read that never comes.
+test "two pipelined requests in one packet both get answered" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll(
+        "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+            "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    const response = try conn.readResponses(allocator, 2);
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(usize, 2), harness.countResponses(response));
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+    // Both bodies came back, so neither request was dropped.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, response, "pong"));
+}
+
+// A pipelined pair where the bodies differ, so a response cannot be
+// mistaken for the other request's.
+test "pipelined requests are answered in order" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nfirst" ++
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nsecond",
+    );
+
+    const response = try conn.readResponses(allocator, 2);
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(usize, 2), harness.countResponses(response));
+    const first_at = std.mem.indexOf(u8, response, "first") orelse return error.FirstBodyMissing;
+    const second_at = std.mem.indexOf(u8, response, "second") orelse return error.SecondBodyMissing;
+    try testing.expect(first_at < second_at);
+}
+
+// The awkward combination: a packet carrying one whole request plus the
+// beginning of another. The remainder must be retained, not dropped, and
+// not mistaken for a complete request.
+test "a whole request plus a partial one is handled correctly" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    const second = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try conn.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n" ++ "GET /ping HTTP/1.1\r\nHost: loc");
+
+    // The first request is answered immediately; the fragment waits.
+    const first = try conn.readResponses(allocator, 1);
+    defer allocator.free(first);
+    try testing.expectEqual(@as(usize, 1), harness.countResponses(first));
+
+    // Completing the fragment produces the second answer.
+    try conn.writeAll(second[second.len - 11 ..]);
+    const rest = try conn.readResponses(allocator, 1);
+    defer allocator.free(rest);
+    try testing.expectEqual(@as(usize, 1), harness.countResponses(rest));
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(rest));
+}
+
+// A chunked request must be refused, not silently framed as having no
+// body. If it were, the chunk data would stay in the buffer and be read as
+// the next request on the connection — request smuggling, and the
+// pipelining support above makes that a live path rather than a
+// theoretical one.
+test "a chunked request is refused and its body is not smuggled" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    // The chunk payload is itself a valid request line. If the server
+    // mis-frames the chunked body, it would route this smuggled request.
+    try conn.writeAll(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "2c\r\nGET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n\r\n0\r\n\r\n",
+    );
+
+    const response = try conn.readResponse(allocator);
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(u16, 411), try harness.statusCode(response));
+    // The smuggled request was never served.
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, response, "pong"));
+}
+
+test "a request declaring both Content-Length and Transfer-Encoding is refused" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    const response = try h.roundTrip(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\n" ++
+            "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+    );
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(u16, 411), try harness.statusCode(response));
+}
