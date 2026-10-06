@@ -41,7 +41,7 @@ Zig 0.16.0. Linux and macOS.
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/vic-Rokx/tether.git
+zig fetch --save git+https://github.com/vic-Rokx/reverb.git
 ```
 
 Then in `build.zig`:
@@ -135,8 +135,11 @@ a `zig fmt` check and a smoke test that serves a request and shuts down on
 ## Status
 
 Pre-1.0 and the API moves. What is covered by tests is listed above; the
-auth, payment and ORM modules under `src/lib/` and `src/pg/` are not yet,
-and should be treated as less settled than the HTTP core.
+auth, payment and websocket modules under `src/lib/` are not, and should
+be treated as less settled than the HTTP core.
+
+The Postgres ORM that used to live here is now its own package — an HTTP
+server has no business carrying a database layer.
 
 ## License
 

@@ -72,10 +72,6 @@
         //    // actually used.
         //    .lazy = false,
         //},
-        .pg = .{
-            .url = "git+https://github.com/karlseguin/pg.zig?ref=master#aef360fef7feb7a65a2d4b6347f413e988845dd6",
-            .hash = "pg-0.0.0-Wp_7gUN_BgC96OS2Q1oxXDjSOkdaSFBP_mYrmOzIw0m3",
-        },
     },
 
     // Specifies the set of files and directories that are included in this package.

@@ -30,9 +30,9 @@ See `README.md` for the public API.
 ## 2. Current state (verified 2026-10-05)
 
 ```
-23,604 lines of Zig across 71 files
-    84 test blocks, all of which run
-    52 tests pass (37 unit, 15 integration)
+19,247 lines of Zig across 55 files  (after the pg split)
+      55 test blocks, all of which run
+      52 tests pass (37 unit, 15 integration)
 ```
 
 - `zig build` succeeds. `zig build test` passes. `zig fmt --check` clean.
@@ -88,28 +88,48 @@ it exits 127 and looks like a pass.
    the only body framing. A `Transfer-Encoding: chunked` request is
    currently mis-framed rather than rejected — worth at least a 411.
 3. **The modules below have no tests**, and were never compiled until
-   this branch: `src/lib/auth/` (KeyStone, Github, Google), `src/lib/payment/Stripe.zig`,
-   `src/lib/claude/`, `src/pg/` (4,357 lines). `src/pg/` has 29 test
-   blocks of its own that are still not wired into any test step.
-4. **These files are reachable from nothing** (verified): `src/lib/core/Url.zig`,
-   `src/lib/payment/Stripe.zig`, `src/lib/claude/{API,VERTEX}.zig`,
-   `src/lib/core/Providers.zig`, `src/error_index.zig`,
-   `src/assembler/api.zig`, `src/sample/sample.zig`. Unlike the files
-   deleted on this branch, these look like standalone features rather
-   than stale duplicates, so they were left alone. Decide which are
-   wanted.
+   this branch: `src/lib/auth/` (KeyStone, Github, Google),
+   `src/lib/payment/Stripe.zig`, `src/lib/claude/`.
+4. **Several files are reachable from nothing** — kept deliberately, they
+   are wanted later: `src/lib/core/Url.zig`, `src/lib/payment/Stripe.zig`,
+   `src/lib/claude/{API,VERTEX}.zig`, `src/lib/core/Providers.zig`,
+   `src/error_index.zig`, `src/assembler/`, `src/execute/`,
+   `src/errors/`, `src/sample/sample.zig`.
+
+   Note that five of them still `@import("pg")` or `@import("pg_orm")`:
+   `error_index.zig`, `assembler/crud.zig`, `execute/handlers.zig`,
+   `execute/queries.zig`, `errors/store.zig`. That compiles today only
+   because nothing reaches them. Wiring any of them up means adding the
+   `pg_orm` package (§5) back as a dependency.
 5. **`Cluster` for multi-worker throughput.** Loom measured 5.16× at 8
    workers. Do this last: the handler is per-worker, so `*Reverb` shared
    across workers needs a thread-safety audit — `arena`, `routes`,
    `logger`, `end_points` and the context pool are all shared today, and
    `Server.use_cors` / `signal_target` are statics.
-6. **`src/lib/core/simdjson/` (7,551 lines) is vendored.** Its two test
-   files were deleted here as dead; if it is a copy of simdjzon it should
-   be a dependency instead.
+6. **`src/lib/core/simdjson/` (7,551 lines) is vendored.** Left as-is by
+   decision. Its two test files were deleted here as dead. If it is a
+   copy of simdjzon it should eventually be a dependency.
 
 ---
 
-## 5. Dead code removed on this branch
+## 5. The pg ORM is now its own package
+
+`src/pg` (4,357 lines) and its two examples moved to
+`../pg-orm` — Reverb is an HTTP server and has no business carrying a
+database layer. The directory is a standalone repo with its own
+`build.zig`, one local commit, **no remote yet**.
+
+Its 29 test blocks had never been wired into a build step either, so they
+had never run. Enabling them needed one fix (`std.io.fixedBufferStream`,
+removed in 0.16). **30 tests pass.** Coverage is the query builders only;
+`Connection.zig` and `result.zig` still need a live database.
+
+Reverb's `build.zig` and `build.zig.zon` no longer reference `pg` at all,
+and the suite is still 52/52 without it — verified.
+
+---
+
+## 6. Dead code removed on this branch
 
 Ten files, ~6,100 lines, unreachable from every build root. Eight were
 untracked, so commit `dbb7235` snapshots them before `98713bb` deletes
@@ -129,7 +149,7 @@ git history — confirmed.
 
 ---
 
-## 6. Commands
+## 7. Commands
 
 ```
 zig build                   # builds
