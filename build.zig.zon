@@ -28,7 +28,7 @@
 
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.16.0",
 
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
@@ -37,8 +37,12 @@
     // internet connectivity.
     .dependencies = .{
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
+        // Pinned by commit so the repository builds without a sibling
+        // checkout. To develop against a local Loom, swap this for
+        // `.{ .path = "../loom" }` temporarily — don't commit that form.
         .loom = .{
-            .path = "../loom"
+            .url = "git+https://github.com/tether-labs/Loom.git#58c08d8edf5bf659992faa5ce574b5ce655153f2",
+            .hash = "loom-0.0.0--12JvspkBACW0RwODMvKvhlAxpXGeg3giQ3Z28KmjTbL",
         },
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
@@ -82,8 +86,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "LICENSE",
+        "README.md",
     },
 }

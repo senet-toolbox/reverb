@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # Reverb sits on Loom, which picks its readiness backend at compile time
+  # -- epoll on Linux, kqueue on macOS -- so the suite has to run on both
+  # or half of it is never exercised. The integration tests bind real
+  # sockets and drive real connections, which is the point: request
+  # framing across packet boundaries is exactly the behaviour a
+  # compile-only check would miss.
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Unit tests
+        run: zig build test-unit -Doptimize=${{ matrix.optimize }}
+
+      - name: Integration tests
+        run: zig build test-integration -Doptimize=${{ matrix.optimize }}
+
+      - name: README example still compiles
+        run: zig build check-readme -Doptimize=${{ matrix.optimize }}
+
+  # Catches a platform-specific API or an undeclared libc dependency in
+  # shared code before it reaches somebody's machine. Compile only --
+  # these targets cannot be executed on the runner. A missing libc
+  # declaration broke the Linux build once while macOS kept working,
+  # because libSystem is linked there regardless.
+  cross-compile:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - aarch64-macos
+          - x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }}
+
+      # The exe and the tests have different dependency graphs, so the
+      # tests get their own cross-compile check.
+      - name: Compile tests for ${{ matrix.target }}
+        run: zig build test-compile -Dtarget=${{ matrix.target }}
+
+  lint:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig fmt
+        run: zig fmt --check src/ tests/ examples/readme_quickstart.zig build.zig
+
+  # The server a reader starts first gets to stay working: serve a
+  # request, then SIGTERM and require a clean exit. A server that ignores
+  # the signal, or that leaks or crashes on the way out, fails here rather
+  # than in somebody's container.
+  smoke:
+    name: server serves and shuts down
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Serve a request and shut down
+        run: |
+          ./zig-out/bin/reverb &
+          pid=$!
+          for _ in $(seq 1 50); do
+            curl -fsS --max-time 1 http://127.0.0.1:8080/ >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          body=$(curl -fsS --max-time 5 http://127.0.0.1:8080/)
+          echo "got: $body"
+          test "$body" = "SUCCESS"
+          kill -TERM $pid
+          wait $pid
+          echo "exited cleanly"

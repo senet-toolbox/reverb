@@ -6,9 +6,13 @@ const posix = std.posix;
 const system = std.posix.system;
 const print = std.debug.print;
 const log = std.log.scoped(.tcp_demo);
-const Logger = @import("Logger.zig");
 const Parsed = std.json.Parsed;
 const net = std.net;
+const helpers = @import("helpers.zig");
+const WebSocket = @import("loom").WebSocket;
+const Abstractions = @import("Abstractions.zig");
+const builtin = @import("builtin");
+
 // const Loom = @import("engine/Loom.zig");
 // const Scheduler = @import("engine/async/Scheduler.zig");
 const Radix = @import("trees/radix.zig");
@@ -19,686 +23,1222 @@ const Buckets = @import("metrics/Buckets.zig");
 const getAllRoutes = Metrics.getAllRoutes;
 const healthCheck = Metrics.healthCheck;
 const EndPoints = Metrics.EndPoints;
-const process = @import("handler.zig").handle;
+// const handle = @import("handler.zig").handler;
 const Ctx_pm = @import("handler.zig").Ctx_pm;
 const StringBuilder = @import("core/builders.zig").String;
 const ContentType = @import("helpers.zig").ContentType;
 const WSS = @import("wss.zig").WSS;
 const loompkg = @import("loom");
+const Logger = loompkg.Logger;
 const Loom = loompkg.Loom;
 const Client = loompkg.Client;
 
-pub const Reverb = @This();
-pub const Config = struct {
-    max: usize = 256,
-    port: u16 = 8080,
-};
-pub var instance: *Reverb = undefined;
-var use_cors: bool = false;
-// Radix tree
-routes: [5]Radix,
-arena: *Allocator,
-config: Config,
-tracking_allocator: ?*TrackingAllocator,
-// cors: ?Cors = null,
-logger: Logger = undefined,
-// Event Loop
-loom: Loom,
-tripwire: Tripwire = undefined,
-wss: ?WSS = null,
-const HandlerFunc = *const fn (*Context) anyerror!void;
-pub const Next = *const fn (*Context) anyerror!void;
-pub const MiddleFunc = *const fn (Next, *Context) anyerror!HandlerFunc;
-pub const GroupRoute = struct {
-    path: []const u8,
-    method: Methods,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-};
+pub fn Server(comptime Config: type) type {
+    return struct {
+        const Reverb = @This();
+        pub const MAX_RECV_SIZE: usize = (Config{}).max_body_size;
 
-const MethodLookup = struct {
-    // First level lookup based on the first character of the method.
-    first_char: [256]u8,
+        var use_cors: bool = false;
+        // Radix tree
+        routes: [5]Radix,
+        arena: Allocator,
+        config: Config,
+        tracking_allocator: ?*TrackingAllocator = null,
+        // cors: ?Cors = null,
+        logger: Logger = undefined,
+        // Event Loop
+        loom: Loom(*Reverb),
+        tripwire: Tripwire = undefined,
+        wss: ?WSS = null,
+        context_pool: Abstractions.ManagedMemoryPool(Context),
+        context_slots: []*Context,
+        request_buffers: []RequestBuffer,
+        /// Registered route paths per method, reported by
+        /// `/metrics/allroutes`. Allocated from this server's arena, so it
+        /// has to live on the instance — see `Metrics.EndPoints`.
+        end_points: EndPoints = .{},
 
-    /// Initializes a lookup table with predefined values for known HTTP methods.
-    pub fn init() @This() {
-        var table = @This(){
-            // Create an array of 256 bytes, all initialized to 0.
-            .first_char = [_]u8{0} ** 256,
+        // ctx: *Context = undefined,
+
+        const HandlerFunc = *const fn (*Context) anyerror!void;
+        pub const Next = *const fn (*Context) anyerror!void;
+        pub const MiddleFunc = *const fn (Next, *Context) anyerror!HandlerFunc;
+        pub const GroupRoute = struct {
+            path: []const u8,
+            method: Methods,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
         };
 
-        // Assign a unique integer for each known HTTP method based on its first letter.
-        // Note: If multiple methods share the same first letter (e.g. POST and PATCH),
-        // they will both map to the same value.
-        table.first_char['G'] = 0; // GET
-        table.first_char['P'] = 1; // POST (or PATCH)
-        table.first_char['D'] = 2; // DELETE
-        table.first_char['H'] = 3; // HEAD
-        table.first_char['O'] = 4; // OPTIONS
-        table.first_char['C'] = 5; // CONNECT
-        table.first_char['T'] = 6; // TRACE
+        const MethodLookup = struct {
+            // First level lookup based on the first character of the method.
+            first_char: [256]u8,
 
-        return table;
-    }
+            /// Initializes a lookup table with predefined values for known HTTP methods.
+            pub fn init() @This() {
+                var table = @This(){
+                    // Create an array of 256 bytes, all initialized to 0.
+                    .first_char = [_]u8{0} ** 256,
+                };
 
-    /// Returns the associated integer for a given HTTP method.
-    /// If the method is empty or unknown, returns 0 (the default value).
-    pub fn lookup(self: *const MethodLookup, method: []const u8) u8 {
-        if (method.len == 0) return 0;
-        return self.first_char[method[0]];
-    }
-}.init();
+                // Assign a unique integer for each known HTTP method based on its first letter.
+                // Note: If multiple methods share the same first letter (e.g. POST and PATCH),
+                // they will both map to the same value.
+                table.first_char['G'] = 0; // GET
+                table.first_char['P'] = 1; // POST (or PATCH)
+                table.first_char['D'] = 2; // DELETE
+                table.first_char['H'] = 3; // HEAD
+                table.first_char['O'] = 4; // OPTIONS
+                table.first_char['C'] = 5; // CONNECT
+                table.first_char['T'] = 6; // TRACE
 
-fn parseMiddleWare(func_num: usize, my_Handler: HandlerFunc, middleswares: []const MiddleFunc) !void {
-    if (func_num + 1 > middleswares.len) {
-        my_Handler(ctx) catch |err| {
-            log.debug("Handler error: {any}", .{err});
-            return err;
+                return table;
+            }
+
+            /// Returns the associated integer for a given HTTP method.
+            /// If the method is empty or unknown, returns 0 (the default value).
+            pub fn lookup(self: *const MethodLookup, method: []const u8) u8 {
+                if (method.len == 0) return 0;
+                return self.first_char[method[0]];
+            }
+        }.init();
+
+        fn parseMiddleWare(reverb: *Reverb, func_num: usize, my_Handler: HandlerFunc, middleswares: []const MiddleFunc, ctx: *Context) !void {
+            if (func_num + 1 > middleswares.len) {
+                my_Handler(ctx) catch |err| {
+                    log.debug("Handler error: {any}", .{err});
+                    return err;
+                };
+            } else {
+                const first_func = middleswares[func_num];
+                const wrappedFunc = first_func(my_Handler, ctx) catch |err| {
+                    return err;
+                };
+                try reverb.parseMiddleWare(func_num + 1, wrappedFunc, middleswares, ctx);
+            }
+        }
+
+        const Methods = enum {
+            GET,
+            POST,
+            DELETE,
+            HEAD,
+            OPTIONS,
+            CONNECT,
+            TRACE,
         };
-    } else {
-        const first_func = middleswares[func_num];
-        const wrappedFunc = first_func(my_Handler, ctx) catch |err| {
-            return err;
+
+        /// Accumulates bytes for one connection until a whole request has
+        /// arrived.
+        ///
+        /// Loom applies no framing — a `process` call gets exactly what one
+        /// `read()` returned — so reassembly is Reverb's job. These are
+        /// indexed by `client.slot`, which loom guarantees is unique among
+        /// live connections, and a slot can be reused once its connection
+        /// closes; `socket` is what distinguishes the new occupant from the
+        /// old one.
+        const RequestBuffer = struct {
+            socket: ?posix.socket_t = null,
+            data: ?[]u8 = null,
+            len: usize = 0,
+            /// Bytes at the front already served. Non-zero only while a
+            /// pipelined packet is being worked through.
+            consumed: usize = 0,
+
+            fn reset(self: *RequestBuffer, allocator: Allocator) void {
+                if (self.data) |data| {
+                    allocator.free(data);
+                }
+                self.* = .{};
+            }
+
+            fn bytes(self: *const RequestBuffer) []const u8 {
+                const data = self.data orelse return "";
+                return data[self.consumed..self.len];
+            }
+
+            /// Marks `n` bytes of the front of the buffer as served.
+            ///
+            /// Bytes are not moved here: a packet usually holds one request,
+            /// so the common case is to consume everything and reset the
+            /// offsets. `compact` handles the leftover case.
+            fn consume(self: *RequestBuffer, n: usize) void {
+                self.consumed += n;
+                if (self.consumed >= self.len) {
+                    // Everything served; start the next read at the front.
+                    self.consumed = 0;
+                    self.len = 0;
+                }
+            }
+
+            /// Moves any unserved tail to the front, so the next append has
+            /// room and the buffer does not grow without bound on a
+            /// long-lived pipelined connection.
+            fn compact(self: *RequestBuffer) void {
+                if (self.consumed == 0) return;
+                const data = self.data orelse return;
+                const remaining = self.len - self.consumed;
+                std.mem.copyForwards(u8, data[0..remaining], data[self.consumed..self.len]);
+                self.consumed = 0;
+                self.len = remaining;
+            }
+
+            fn append(
+                self: *RequestBuffer,
+                allocator: Allocator,
+                client: *Client,
+                chunk: []const u8,
+                max_len: usize,
+            ) !void {
+                // Only a different socket means a different connection has
+                // taken over this slot. `client.read_timeout` must not be
+                // part of this test: it is an idle deadline that loom
+                // refreshes on every read, so comparing it discarded the
+                // bytes buffered so far every time a request arrived in
+                // more than one packet.
+                if (self.socket == null or self.socket.? != client.socket) {
+                    self.reset(allocator);
+                    self.socket = client.socket;
+                }
+
+                // Reclaim any already-served prefix before measuring room,
+                // so a pipelined connection is not reported as full because
+                // of bytes that have already been answered.
+                self.compact();
+
+                if (chunk.len > max_len - self.len) return error.RequestTooLarge;
+                try self.ensureCapacity(allocator, self.len + chunk.len, max_len);
+
+                const data = self.data.?;
+                @memcpy(data[self.len .. self.len + chunk.len], chunk);
+                self.len += chunk.len;
+            }
+
+            fn ensureCapacity(
+                self: *RequestBuffer,
+                allocator: Allocator,
+                needed: usize,
+                max_len: usize,
+            ) !void {
+                if (self.data) |data| {
+                    if (needed <= data.len) return;
+
+                    const next_cap = @min(max_len, @max(needed, data.len * 2));
+                    const next = try allocator.alloc(u8, next_cap);
+                    @memcpy(next[0..self.len], data[0..self.len]);
+                    allocator.free(data);
+                    self.data = next;
+                    return;
+                }
+
+                const initial_cap = @min(max_len, @max(needed, @as(usize, 4096)));
+                self.data = try allocator.alloc(u8, initial_cap);
+            }
         };
-        try parseMiddleWare(func_num + 1, wrappedFunc, middleswares);
-    }
-}
 
-const Methods = enum {
-    GET,
-    POST,
-    DELETE,
-    HEAD,
-    OPTIONS,
-    CONNECT,
-    TRACE,
-};
+        /// This function adds the route to the reverb radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `method`: Methods,
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn addRoute(
+            reverb: *Reverb,
+            path: []const u8,
+            method: Methods,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            std.log.info("addRoute {s} {s}", .{ path, method });
+            // const idx = MethodLookup.first_char[method[0]];
+            var radix = reverb.routes[@as(usize, @intFromEnum(method))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            switch (method) {
+                .GET => try addToEndpoints(&reverb.end_points.GET, route_path, reverb.arena),
+                .POST => try addToEndpoints(&reverb.end_points.POST, route_path, reverb.arena),
+                .DELETE => try addToEndpoints(&reverb.end_points.DELETE, route_path, reverb.arena),
+                else => return error.CouldNotMatchMethod,
+            }
+            return;
+        }
 
-/// This function adds the route to the reverb radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `method`: Methods,
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn addRoute(
-    reverb: *Reverb,
-    path: []const u8,
-    method: Methods,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    // const idx = MethodLookup.first_char[method[0]];
-    var radix = reverb.routes[@as(usize, @intFromEnum(method))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    switch (method) {
-        .GET => try addToEndpoints(&Metrics.end_points.GET, route_path, reverb.arena.*),
-        .POST => try addToEndpoints(&Metrics.end_points.POST, route_path, reverb.arena.*),
-        .DELETE => try addToEndpoints(&Metrics.end_points.DELETE, route_path, reverb.arena.*),
-        else => return error.CouldNotMatchMethod,
-    }
-    return;
-}
+        /// This function adds the route to the reverb Get radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn get(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.GET))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.GET, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the reverb Get radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn get(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.GET))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.GET, route_path, reverb.arena.*);
-    return;
-}
+        /// This function adds the route to the reverb Get radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn all(
+            reverb: *Reverb,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.GET))];
+            radix.universal_mode = true;
+            try radix.addUniversalRoute(handler, middlewares);
+            radix.universal_mode = true;
+            reverb.routes[@as(usize, @intFromEnum(Methods.GET))] = radix;
+            return;
+        }
 
-/// This function adds the route to the reverb Get radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn all(
-    reverb: *Reverb,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.GET))];
-    radix.universal_mode = true;
-    try radix.addUniversalRoute(handler, middlewares);
-    radix.universal_mode = true;
-    reverb.routes[@as(usize, @intFromEnum(Methods.GET))] = radix;
-    return;
-}
+        /// This function adds the route to the reverb Delete radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn delete(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.DELETE))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.DELETE, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the reverb Delete radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn delete(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.DELETE))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.DELETE, route_path, reverb.arena.*);
-    return;
-}
+        /// This function adds the route to the POST radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn post(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.POST))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.POST, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the POST radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn post(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.POST))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.POST, route_path, reverb.arena.*);
-    return;
-}
+        /// This function adds the route to the reverb Head radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn head(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.HEAD))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.HEAD, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the reverb Head radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn head(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.HEAD))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.HEAD, route_path, reverb.arena.*);
-    return;
-}
+        /// This function adds the route to the reverb Options radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn options(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.OPTIONS))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.OPTIONS, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the reverb Options radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn options(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.OPTIONS))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.OPTIONS, route_path, reverb.arena.*);
-    return;
-}
+        /// This function adds the route to the reverb Connect radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn connect(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.CONNECT))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.CONNECT, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the reverb Connect radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn connect(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.CONNECT))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.CONNECT, route_path, reverb.arena.*);
-    return;
-}
+        /// This function adds the route to the reverb Trace radix tree.
+        /// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
+        /// # Parameters:
+        /// - `target`: *Reverb.
+        /// - `path`: []const u8
+        /// - `handler`: HandlerFunc
+        /// - `middlewares`: []const MiddleFunc
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn trace(
+            reverb: *Reverb,
+            path: []const u8,
+            handler: HandlerFunc,
+            middlewares: []const MiddleFunc,
+        ) !void {
+            var radix = reverb.routes[@as(usize, @intFromEnum(Methods.TRACE))];
+            const out = try std.fmt.allocPrint(reverb.arena, "{s}", .{path});
+            try radix.addRoute(out, handler, middlewares);
+            const end_colon_op = std.mem.indexOf(u8, path, "/:");
+            var route_path: []const u8 = path;
+            if (end_colon_op) |end_colon| {
+                route_path = path[0..end_colon];
+            }
+            // Add the path to the appropriate endpoints array
+            try addToEndpoints(&reverb.end_points.TRACE, route_path, reverb.arena);
+            return;
+        }
 
-/// This function adds the route to the reverb Trace radix tree.
-/// Deinitializes the reverb instance recursively calls routes deinit routes from radix tree
-/// # Parameters:
-/// - `target`: *Reverb.
-/// - `path`: []const u8
-/// - `handler`: HandlerFunc
-/// - `middlewares`: []const MiddleFunc
-///
-/// # Returns:
-/// !void.
-pub fn trace(
-    reverb: *Reverb,
-    path: []const u8,
-    handler: HandlerFunc,
-    middlewares: []const MiddleFunc,
-) !void {
-    var radix = reverb.routes[@as(usize, @intFromEnum(Methods.TRACE))];
-    const out = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{path});
-    try radix.addRoute(out, handler, middlewares);
-    const end_colon_op = std.mem.indexOf(u8, path, "/:");
-    var route_path: []const u8 = path;
-    if (end_colon_op) |end_colon| {
-        route_path = path[0..end_colon];
-    }
-    // Add the path to the appropriate endpoints array
-    try addToEndpoints(&Metrics.end_points.TRACE, route_path, reverb.arena.*);
-    return;
-}
+        /// Helper function to add a path to the respective endpoints array
+        fn addToEndpoints(endpoints: *?[][]const u8, path: []const u8, allocator: std.mem.Allocator) !void {
+            if (endpoints.*) |existing| {
+                // Resize the existing array to accommodate one more path
+                var new_endpoints = try allocator.realloc(existing, existing.len + 1);
+                // Duplicate the path string to ensure it's owned by the endpoints
+                new_endpoints[existing.len] = try allocator.dupe(u8, path);
+                endpoints.* = new_endpoints;
+            } else {
+                // Create a new array with one path
+                var new_endpoints = try allocator.alloc([]const u8, 1);
+                new_endpoints[0] = try allocator.dupe(u8, path);
+                endpoints.* = new_endpoints;
+            }
+        }
 
-/// Helper function to add a path to the respective endpoints array
-fn addToEndpoints(endpoints: *?[][]const u8, path: []const u8, allocator: std.mem.Allocator) !void {
-    if (endpoints.*) |existing| {
-        // Resize the existing array to accommodate one more path
-        var new_endpoints = try allocator.realloc(existing, existing.len + 1);
-        // Duplicate the path string to ensure it's owned by the endpoints
-        new_endpoints[existing.len] = try allocator.dupe(u8, path);
-        endpoints.* = new_endpoints;
-    } else {
-        // Create a new array with one path
-        var new_endpoints = try allocator.alloc([]const u8, 1);
-        new_endpoints[0] = try allocator.dupe(u8, path);
-        endpoints.* = new_endpoints;
-    }
-}
+        pub fn groupRoutes(
+            reverb: *Reverb,
+            group_path: []const u8,
+            grouped_routes: []const GroupRoute,
+        ) !void {
+            // pick a sane upper bound for your paths:
+            // const MaxPathLen = 256;
+            // var buf: [MaxPathLen]u8 = undefined;
 
-pub fn groupRoutes(
-    reverb: *Reverb,
-    group_path: []const u8,
-    grouped_routes: []const GroupRoute,
-) !void {
-    // pick a sane upper bound for your paths:
-    // const MaxPathLen = 256;
-    // var buf: [MaxPathLen]u8 = undefined;
+            for (grouped_routes) |gr| {
+                const out = try std.fmt.allocPrint(reverb.arena, "{s}{s}", .{ group_path, gr.path });
+                try reverb.addRoute(out, gr.method, gr.handler, gr.middlewares);
+            }
+        }
 
-    for (grouped_routes) |gr| {
-        const out = try std.fmt.allocPrint(reverb.arena.*, "{s}{s}", .{ group_path, gr.path });
-        try reverb.addRoute(out, gr.method, gr.handler, gr.middlewares);
-    }
-}
+        pub fn detectConfig(file: std.Io.File) Config {
+            const force_color: ?bool = if (builtin.os.tag == .wasi)
+                null // wasi does not support environment variables
+            else if (std.process.Environ.containsConstant("NO_COLOR"))
+                false
+            else if (std.process.Environ.containsConstant("CLICOLOR_FORCE"))
+                true
+            else
+                null;
 
-// Radix is a Radix tree routes is a hashmap with the method, each method has a radix tree
-pub fn callRoute(reverb: *Reverb, ctx_pm: Ctx_pm, passed_ctx: *Context) !void {
-    const idx = MethodLookup.first_char[ctx_pm.method[0]];
-    var radix = reverb.routes[idx];
-    // this cuts almost half
-    const entry = radix.searchRoute(ctx_pm.path) catch return error.SearchRoute;
+            if (force_color == false) return .no_color;
 
-    if (entry == null) {
-        const ret_addr = @returnAddress();
-        const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
-        // 1) Prepare a big enough buffer on the stack
-        var buffer: [512]u8 = undefined;
-        var stream = std.Io.Writer.fixed(&buffer);
-        const writer = &stream;
+            if (file.getOrEnableAnsiEscapeSupport()) return .escape_codes;
 
-        // 3) Call printSourceAtAddress into *your* writer
-        const tty = std.io.tty.detectConfig(std.fs.File.stderr());
-        try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
+            return if (force_color == true) .escape_codes else .no_color;
+        }
 
-        const outSlice = buffer[0..stream.end];
-        const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
-        const src = buffer[start..stream.end];
-        var sections = std.mem.splitScalar(u8, src, ':');
-        var indents = std.mem.splitScalar(u8, src, '\n');
-        const file_name = sections.next() orelse return;
-        const line = sections.next() orelse return;
-        const u32_line_n: u32 = std.fmt.parseInt(u32, line, 10) catch return;
-        _ = indents.next().?;
-        const fn_name = indents.next().?;
-        const err_str = try std.fmt.allocPrint(reverb.arena.*, "{any}", .{error.MethodNotSupported});
-        const function_name = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{fn_name[0 .. fn_name.len - 2]});
-        const file_name_alloc = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{file_name});
-        _ = Tripwire.Error{
-            .timestamp = std.time.timestamp(),
-            .error_name = err_str,
-            .line = u32_line_n,
-            .file = file_name_alloc,
-            .request = ctx_pm.path,
-            .function = function_name,
-        };
-        // Reverb.instance.tripwire.recordError(payload);
-        return error.RouteNotSupported;
-    }
-    if (entry.?.route_func == null) {
-        return error.MethodNotSupported;
-    }
-    const entry_fn = entry.?.route_func.?.handler_func;
-    const middlewares = entry.?.route_func.?.middlewares;
-    const param_args_op = entry.?.param_args;
-    if (param_args_op) |param_args| {
-        if (param_args.items.len > 0) {
-            for (param_args.items) |param| {
-                passed_ctx.addQueryParam(param.param, param.value) catch |err| {
-                    try Reverb.instance.logger.err("AppendQueryParam Error: {any}", .{err});
-                    return error.AppendQueryParam;
+        // Radix is a Radix tree routes is a hashmap with the method, each method has a radix tree
+        pub fn callRoute(reverb: *Reverb, ctx_pm: Ctx_pm, passed_ctx: *Context) !void {
+            const idx = MethodLookup.first_char[ctx_pm.method[0]];
+            var radix = reverb.routes[idx];
+
+            // this cuts almost half
+            const entry = radix.searchRoute(ctx_pm.path) catch return error.SearchRoute;
+
+            if (entry == null) {
+                // const ret_addr = @returnAddress();
+                // // const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
+                // // // 1) Prepare a big enough buffer on the stack
+                // var buffer: [512]u8 = undefined;
+                // var stream = std.Io.Writer.fixed(&buffer);
+                // const writer = &stream;
+                // //
+                // // // 3) Call printSourceAtAddress into *your* writer
+                // // const tty = detectConfig(std.fs.File.stderr());
+                // // try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
+                //
+                // var threaded: std.Io.Threaded = .init(reverb.arena, .{});
+                // const io = threaded.io();
+                // defer threaded.deinit();
+                //
+                // var text_arena = std.heap.ArenaAllocator.init());
+                // defer text_arena.deinit();
+                //
+                // const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
+                //
+                // std.debug.printSourceAtAddress(
+                //     io,
+                //     &text_arena,
+                //     debug_info,
+                //     .{ .writer = writer }, // or detect from stderr
+                //     .{ .address = ret_addr },
+                // ) catch {};
+                //
+                // const outSlice = buffer[0..stream.end];
+                // const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
+                // const src = buffer[start..stream.end];
+                // var sections = std.mem.splitScalar(u8, src, ':');
+                // var indents = std.mem.splitScalar(u8, src, '\n');
+                // const file_name = sections.next() orelse return;
+                // const line = sections.next() orelse return;
+                // const u32_line_n: u32 = std.fmt.parseInt(u32, line, 10) catch return;
+                // _ = indents.next().?;
+                // const fn_name = indents.next().?;
+                // const err_str = try std.fmt.allocPrint(reverb.arena, "{any}", .{error.MethodNotSupported});
+                // const function_name = try std.fmt.allocPrint(reverb.arena, "{s}", .{fn_name[0 .. fn_name.len - 2]});
+                // const file_name_alloc = try std.fmt.allocPrint(reverb.arena, "{s}", .{file_name});
+                // _ = Tripwire.Error{
+                //     .timestamp = std.time.timestamp(),
+                //     .error_name = err_str,
+                //     .line = u32_line_n,
+                //     .file = file_name_alloc,
+                //     .request = ctx_pm.path,
+                //     .function = function_name,
+                // };
+                // Reverb.instance.tripwire.recordError(payload);
+                return error.RouteNotSupported;
+            }
+            if (entry.?.route_func == null) {
+                return error.MethodNotSupported;
+            }
+            const entry_fn = entry.?.route_func.?.handler_func;
+            const middlewares = entry.?.route_func.?.middlewares;
+            const param_args_op = entry.?.param_args;
+            if (param_args_op) |param_args| {
+                if (param_args.items.len > 0) {
+                    for (param_args.items) |param| {
+                        // Path parameters are recorded in both places. They
+                        // belong in `params` — that is what `ctx.param()`
+                        // reads, and until now nothing populated it, so that
+                        // accessor could never return a value. They are also
+                        // still added to `query_params`, because that is
+                        // where they used to land and handlers may read them
+                        // through `ctx.queryParam()`.
+                        passed_ctx.addParam(param.param, param.value) catch |err| {
+                            try reverb.logger.err("AppendParam Error: {any}", .{err}, null);
+                            return error.AppendParam;
+                        };
+                        passed_ctx.addQueryParam(param.param, param.value) catch |err| {
+                            try reverb.logger.err("AppendQueryParam Error: {any}", .{err}, null);
+                            return error.AppendQueryParam;
+                        };
+                    }
+                }
+            }
+
+            if (middlewares.len > 0) {
+                reverb.parseMiddleWare(0, entry_fn, middlewares, passed_ctx) catch return error.ParsingMiddleware;
+            } else {
+                entry_fn(passed_ctx) catch |err| {
+                    // const ret_addr = @intFromPtr(entry_fn);
+                    // const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
+                    // // 1) Prepare a big enough buffer on the stack
+                    // // 1) Prepare a big enough buffer on the stack
+                    // var buffer: [512]u8 = undefined;
+                    // var stream = std.Io.Writer.fixed(&buffer);
+                    // const writer = &stream;
+                    //
+                    // // 3) Call printSourceAtAddress into *your* writer
+                    // const tty = std.io.tty.detectConfig(std.fs.File.stderr());
+                    // try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
+                    // const outSlice = buffer[0..stream.end];
+                    // const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
+                    // const src = buffer[start..stream.end];
+                    // var sections = std.mem.splitScalar(u8, src, ':');
+                    // var indents = std.mem.splitScalar(u8, src, '\n');
+                    // const file_name = sections.next() orelse return;
+                    // const file_name_alloc = try std.fmt.allocPrint(reverb.arena, "{s}", .{file_name});
+                    // const line = sections.next() orelse return;
+                    // const u32_line_n: u32 = try std.fmt.parseInt(u32, line, 10);
+                    // _ = indents.next().?;
+                    // const fn_name = indents.next().?;
+                    // const err_str = try std.fmt.allocPrint(reverb.arena, "{any}", .{error.MethodNotSupported});
+                    // const function_name = try std.fmt.allocPrint(reverb.arena, "{s}", .{fn_name[0 .. fn_name.len - 2]});
+                    // _ = Tripwire.Error{
+                    //     .timestamp = std.time.timestamp(),
+                    //     .error_name = err_str,
+                    //     .line = u32_line_n,
+                    //     .file = file_name_alloc,
+                    //     .request = ctx_pm.path,
+                    //     .function = function_name,
+                    // };
+                    // Reverb.instance.tripwire.recordError(payload);
+                    return err;
                 };
             }
         }
-    }
 
-    if (middlewares.len > 0) {
-        parseMiddleWare(0, entry_fn, middlewares) catch return error.ParsingMiddleware;
-    } else {
-        entry_fn(passed_ctx) catch |err| {
-            // const ret_addr = @intFromPtr(entry_fn);
-            // const debug_info = std.debug.getSelfDebugInfo() catch @panic("Could not get debug_info");
-            // // 1) Prepare a big enough buffer on the stack
-            // // 1) Prepare a big enough buffer on the stack
-            // var buffer: [512]u8 = undefined;
-            // var stream = std.Io.Writer.fixed(&buffer);
-            // const writer = &stream;
-            //
-            // // 3) Call printSourceAtAddress into *your* writer
-            // const tty = std.io.tty.detectConfig(std.fs.File.stderr());
-            // try std.debug.printSourceAtAddress(debug_info, writer, ret_addr, tty);
-            // const outSlice = buffer[0..stream.end];
-            // const start = std.mem.indexOf(u8, outSlice, "src") orelse std.mem.indexOf(u8, outSlice, "std") orelse 0;
-            // const src = buffer[start..stream.end];
-            // var sections = std.mem.splitScalar(u8, src, ':');
-            // var indents = std.mem.splitScalar(u8, src, '\n');
-            // const file_name = sections.next() orelse return;
-            // const file_name_alloc = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{file_name});
-            // const line = sections.next() orelse return;
-            // const u32_line_n: u32 = try std.fmt.parseInt(u32, line, 10);
-            // _ = indents.next().?;
-            // const fn_name = indents.next().?;
-            // const err_str = try std.fmt.allocPrint(reverb.arena.*, "{any}", .{error.MethodNotSupported});
-            // const function_name = try std.fmt.allocPrint(reverb.arena.*, "{s}", .{fn_name[0 .. fn_name.len - 2]});
-            // _ = Tripwire.Error{
-            //     .timestamp = std.time.timestamp(),
-            //     .error_name = err_str,
-            //     .line = u32_line_n,
-            //     .file = file_name_alloc,
-            //     .request = ctx_pm.path,
-            //     .function = function_name,
-            // };
-            // Reverb.instance.tripwire.recordError(payload);
-            return err;
-        };
-    }
-}
+        // Radix is a Radix tree routes is a hashmap with the method, each method has a radix tree
+        pub fn getRoute(t: *Reverb, ctx_pm: Ctx_pm) !?HandlerFunc {
+            const idx = MethodLookup.first_char[ctx_pm.method[0]];
+            var radix = t.routes[idx];
+            // var op_method_rdx_tree: ?Radix = null;
+            // op_method_rdx_tree = reverb.routes.get(ctx_pm.method);
+            // var rdx_tree = op_method_rdx_tree orelse return null;
+            // // const path = try reverb.arena.dupe(u8, ctx_pm.path);
+            const entry = try radix.searchRoute(ctx_pm.path);
+            if (entry == null) {
+                return error.MethodNotSupported;
+            }
+            if (entry.?.route_func == null) {
+                return error.MethodNotSupported;
+            }
+            const entry_fn: HandlerFunc = @ptrCast(entry.?.route_func.?.handler_func);
+            // return apiTest;
+            return entry_fn;
+        }
 
-// Radix is a Radix tree routes is a hashmap with the method, each method has a radix tree
-pub fn getRoute(t: *Reverb, ctx_pm: Ctx_pm) !?HandlerFunc {
-    const idx = MethodLookup.first_char[ctx_pm.method[0]];
-    var radix = t.routes[idx];
-    // var op_method_rdx_tree: ?Radix = null;
-    // op_method_rdx_tree = reverb.routes.get(ctx_pm.method);
-    // var rdx_tree = op_method_rdx_tree orelse return null;
-    // // const path = try reverb.arena.dupe(u8, ctx_pm.path);
-    const entry = try radix.searchRoute(ctx_pm.path);
-    if (entry == null) {
-        return error.MethodNotSupported;
-    }
-    if (entry.?.route_func == null) {
-        return error.MethodNotSupported;
-    }
-    const entry_fn: HandlerFunc = @ptrCast(entry.?.route_func.?.handler_func);
-    // return apiTest;
-    return entry_fn;
-}
+        // fn createContext(reverb: *Reverb, comptime T: type, data: T) !Context {
+        //     const ctx = try Context.init(reverb.arena, data);
+        //     return ctx;
+        // }
 
-// fn createContext(reverb: *Reverb, comptime T: type, data: T) !Context {
-//     const ctx = try Context.init(reverb.arena, data);
-//     return ctx;
-// }
+        /// This is the Cors struct default set to null
+        pub var cors: ?Cors = null;
+        pub fn new(target: *Reverb, config: Config, arena: Allocator) !void {
+            var radix1: Radix = undefined;
+            try radix1.init(arena);
 
-/// This is the Cors struct default set to null
-pub var cors: ?Cors = null;
-pub var ctx: *Context = undefined;
-pub fn new(target: *Reverb, config: Config, arena: *Allocator, ta: ?*TrackingAllocator) !void {
-    var radix1: Radix = undefined;
-    try radix1.init(arena);
+            var radix2: Radix = undefined;
+            try radix2.init(arena);
 
-    var radix2: Radix = undefined;
-    try radix2.init(arena);
+            var radix3: Radix = undefined;
+            try radix3.init(arena);
 
-    var radix3: Radix = undefined;
-    try radix3.init(arena);
+            var radix4: Radix = undefined;
+            try radix4.init(arena);
 
-    var radix4: Radix = undefined;
-    try radix4.init(arena);
+            var radix5: Radix = undefined;
+            try radix5.init(arena);
 
-    var radix5: Radix = undefined;
-    try radix5.init(arena);
+            const routes_map = [5]Radix{ radix1, radix2, radix3, radix4, radix5 };
 
-    const routes_map = [5]Radix{ radix1, radix2, radix3, radix4, radix5 };
-    var loom: Loom = undefined;
-    try loom.new(.{ .callback = process, .server_port = config.port }, arena);
+            // An optional field, so existing Config types keep loom's own
+            // default of 0.0.0.0 and only callers that ask for a specific
+            // interface get one.
+            const server_addr = if (@hasField(Config, "host")) config.host else "0.0.0.0";
 
-    var logger: Logger = undefined;
-    logger.init();
-    // Buckets.init(arena);
+            var loom: Loom(*Reverb) = undefined;
+            try loom.new(.{
+                .server_addr = server_addr,
+                .server_port = config.port,
+                .max = config.max,
+                .max_body_size = config.max_body_size,
+            }, arena, target);
 
-    // var buckets_thread = try std.Thread.spawn(.{}, Buckets.loop, .{});
-    // buckets_thread.detach();
+            var logger: Logger = undefined;
+            logger.init();
+            // Buckets.init(arena);
 
-    target.* = .{
-        .config = config,
-        .arena = arena,
-        .routes = routes_map,
-        .logger = logger,
-        .loom = loom,
-        .tracking_allocator = ta,
+            // var buckets_thread = try std.Thread.spawn(.{}, Buckets.loop, .{});
+            // buckets_thread.detach();
+
+            target.* = .{
+                .arena = arena,
+                .routes = routes_map,
+                .logger = logger,
+                .loom = loom,
+                .config = config,
+                .context_pool = Abstractions.ManagedMemoryPool(Context).init(arena),
+                .context_slots = try arena.alloc(*Context, config.max),
+                .request_buffers = try arena.alloc(RequestBuffer, config.max),
+            };
+
+            for (target.request_buffers) |*request_buffer| {
+                request_buffer.* = .{};
+            }
+
+            // `getAllRoutes` is a plain handler with no path back to its
+            // server, so it reaches the endpoint lists through this pointer.
+            Metrics.active_end_points = &target.end_points;
+
+            for (0..target.context_slots.len) |i| {
+                const ctx_op = try target.context_pool.create();
+                ctx_op.* = try Context.init(
+                    target.arena,
+                    "",
+                    "",
+                    null,
+                    null,
+                    ContentType.None,
+                    null,
+                    20,
+                );
+                target.context_slots[i] = ctx_op;
+            }
+        }
+
+        pub fn deinit(self: *Reverb) void {
+            // Clear the signal handler's target first: once this instance is
+            // torn down, a late signal must not reach it.
+            if (signal_target == self) signal_target = null;
+            if (Metrics.active_end_points == &self.end_points) {
+                Metrics.active_end_points = null;
+            }
+
+            for (&self.routes) |*radix| {
+                radix.deinit();
+            }
+            for (self.request_buffers) |*request_buffer| {
+                request_buffer.reset(self.arena);
+            }
+            self.arena.free(self.request_buffers);
+            self.loom.deinit();
+            if (self.end_points.GET) |ep_get| {
+                for (ep_get) |elem| {
+                    self.arena.free(elem);
+                }
+                self.arena.free(ep_get);
+            }
+            if (self.end_points.POST) |ep_post| {
+                for (ep_post) |elem| {
+                    self.arena.free(elem);
+                }
+                self.arena.free(ep_post);
+            }
+            if (self.end_points.PATCH) |ep_patch| {
+                for (ep_patch) |elem| {
+                    self.arena.free(elem);
+                }
+                self.arena.free(ep_patch);
+            }
+        }
+
+        fn getOrCreateContextForClient(reverb: *Reverb, client: *Client) !*Context {
+            const slot_index = client.slot;
+            if (slot_index >= reverb.context_slots.len) return error.ContextSlotOutOfRange;
+            return reverb.context_slots[slot_index];
+        }
+
+        pub fn process(reverb: *Reverb, new_client: *Client, new_recv_data: []const u8) !void {
+            handle(reverb, new_client, new_recv_data) catch |err| {
+                return err;
+            };
+        }
+
+        pub fn useWss(reverb: *Reverb, wss_config: WSS.Config) !void {
+            reverb.wss = try WSS.init(wss_config);
+        }
+
+        fn initTripwire(reverb: *Reverb) !void {
+            reverb.tripwire.init(reverb.arena);
+        }
+
+        pub fn useTripwire(reverb: *Reverb) !void {
+            reverb.tripwire.init(reverb.arena);
+        }
+        //
+        fn initMetrics(reverb: *Reverb) !void {
+            // try metrics.mapRoutes();
+            try reverb.addRoute("/metrics/allroutes", .GET, getAllRoutes, &[_]MiddleFunc{});
+            try reverb.addRoute("/metrics/healthcheck", .GET, healthCheck, &[_]MiddleFunc{});
+            // try nimbus.addRoute("/metrics/allroutes", "GET", Metrics.allEndPoints, &[_]MiddleFunc{});
+            // try nimbus.addRoute("/metrics/server-status", "GET", dashboard.serverStatus, &[_]MiddleFunc{});
+            // try nimbus.addRoute("/dashboard/request-metrics", "GET", dashboard.requestMetrics, &[_]MiddleFunc{});
+        }
+
+        pub fn useCors(_: *Reverb, corsConfig: Cors) !void {
+            cors = corsConfig;
+            use_cors = true;
+        }
+
+        pub fn useStatic(reverb: *Reverb, dir: []const u8) !void {
+            const path = try std.fmt.allocPrint(reverb.arena, "/{s}/:file", .{dir});
+            defer reverb.arena.free(path);
+            try reverb.addRoute(path, .GET, staticHandler, &[_]MiddleFunc{});
+        }
+
+        threadlocal var buf: [524288]u8 = undefined;
+        var file_path: [512]u8 = undefined;
+
+        // Add a simple in-memory cache for small files
+        // const FileCache = struct {
+        //     data: []const u8 = ,
+        //     content_type: []const u8,
+        // }{};
+
+        fn staticHandler(static_ctx: *Context) !void {
+            file_path[0] = '.';
+            @memcpy(file_path[1 .. static_ctx.route.len + 1], static_ctx.route);
+            const file = try std.fs.cwd().openFile(file_path[0 .. static_ctx.route.len + 1], .{});
+            defer file.close();
+            const bytes_read = try std.posix.pread(file.handle, &buf, 0);
+            try static_ctx.FILE(buf[0..bytes_read]);
+        }
+
+        /// Backing store for the assembled CORS header block.
+        ///
+        /// `Context.cors_headers` is a global holding a slice of this, read
+        /// on every preflight for the life of the process, so the buffer
+        /// cannot be a local of `prepare`.
+        var cors_header_buffer: [4096]u8 = undefined;
+
+        /// Applies configuration that has to be in place before the first
+        /// request is served. Idempotent, and called by both `listen` and
+        /// `bindListener`.
+        fn prepare(reverb: *Reverb) !void {
+            _ = reverb;
+            if (use_cors) {
+                var str_builder = StringBuilder.new(&cors_header_buffer);
+                try cors.?.checkHeadersStr(&str_builder);
+                // Emitting a half-built CORS block would silently relax the
+                // policy the caller configured, so refuse to start instead.
+                if (str_builder.overflowed) return error.CorsHeadersTooLarge;
+                Context.cors_headers = str_builder.slice();
+            }
+        }
+
+        /// Runs the event loop until `stop` is called.
+        ///
+        /// # Returns:
+        /// !void.
+        pub fn listen(reverb: *Reverb) !void {
+            try reverb.prepare();
+            try reverb.loom.serve();
+        }
+
+        /// Binds and arms the listening socket without entering the event
+        /// loop.
+        ///
+        /// Split out from `listen` so a caller can read `boundPort` before
+        /// the loop takes over the thread — which is what makes
+        /// `port = 0` (an ephemeral, kernel-assigned port) usable, and what
+        /// lets a test bind first and connect without racing the server.
+        /// Idempotent.
+        pub fn bindListener(reverb: *Reverb) !void {
+            try reverb.prepare();
+            try reverb.loom.bindListener();
+        }
+
+        /// The port the listener actually bound to. Only meaningful after
+        /// `bindListener` or `listen`.
+        pub fn boundPort(reverb: *Reverb) !u16 {
+            return reverb.loom.boundPort();
+        }
+
+        /// The instance a received signal should stop.
+        ///
+        /// A signal handler cannot take arguments, so the target has to be
+        /// reachable from a global. Only one server per process can install
+        /// handlers; `installSignalHandlers` reports a conflict rather than
+        /// silently overwriting.
+        var signal_target: ?*Reverb = null;
+
+        // The signal-number type is platform-specific (an enum on Darwin, an
+        // integer elsewhere), so it is taken from `Sigaction` rather than
+        // spelled out.
+        fn handleShutdownSignal(_: posix.SIG) callconv(.c) void {
+            // Only async-signal-safe work here: an atomic store and a write
+            // to the wake pipe, both of which `stop` is careful to keep safe.
+            if (signal_target) |target| target.stop();
+        }
+
+        /// Installs `SIGTERM` and `SIGINT` handlers that stop this server.
+        ///
+        /// Without this a container runtime's `SIGTERM` kills the process
+        /// outright, dropping in-flight responses; with it, `listen` returns
+        /// and the caller's `deinit` runs. `SIGPIPE` is also ignored, so a
+        /// client that disconnects mid-response surfaces as `EPIPE` on write
+        /// instead of killing the process.
+        pub fn installSignalHandlers(reverb: *Reverb) !void {
+            if (signal_target != null and signal_target != reverb) {
+                return error.SignalHandlersAlreadyInstalled;
+            }
+            signal_target = reverb;
+
+            var action = posix.Sigaction{
+                .handler = .{ .handler = handleShutdownSignal },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.TERM, &action, null);
+            posix.sigaction(posix.SIG.INT, &action, null);
+
+            var ignore = posix.Sigaction{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.PIPE, &ignore, null);
+        }
+
+        /// Asks the event loop to finish, so `listen` returns.
+        ///
+        /// Safe to call from another thread while the loop is blocked in
+        /// the poller, and safe to call from a signal handler: it only
+        /// stores an atomic flag and writes to the wake pipe. Also safe to
+        /// call before the loop starts, and more than once.
+        ///
+        /// In-flight connections are torn down by `deinit`, not here.
+        pub fn stop(reverb: *Reverb) void {
+            reverb.loom.stop();
+        }
+
+        pub fn handle(
+            reverb: *Reverb,
+            new_client: *Client,
+            new_recv_data: []const u8,
+        ) !void {
+            var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
+            const client = new_client;
+            const recv_data = new_recv_data;
+            if (recv_data.len == 0) {
+                // Browsers (or firefox?) attempt to optimize for speed
+                // by opening a connection to the server once a user highlights
+                // a link, but doesn't start sending the request until it's
+                // clicked. The request eventually times out so we just
+                // go agane.
+                // try reverb.logger.warn("Got connection but no header!", .{}, @src());
+                return;
+            }
+
+            const ctx = reverb.context_slots[client.slot];
+
+            defer ctx.clear();
+
+            ctx.client = client;
+
+            if (client.client_type == .WebSocket) {
+                if (recv_data.len > recv_buf.len) return error.MalformedRequest;
+                @memcpy(recv_buf[0..recv_data.len], recv_data[0..]);
+                ctx.client.?.msg = recv_buf[0..recv_data.len];
+
+                var ws = client.ws orelse {
+                    print("Parser not found\n", .{});
+                    return;
+                };
+
+                // Feed the received data into the parser
+                ws.parser.feed(recv_buf[0..recv_data.len]) catch |err| {
+                    print("Parser feed error: {any}\n", .{err});
+                    return;
+                };
+
+                // Now try to parse the message
+                const message = ws.receiveMessage(true) catch |err| {
+                    if (err == error.IncompleteFrame) {
+                        // Need more data - this is normal, just wait for next recv
+                        return;
+                    }
+                    print("Parser ReceiveMessage WebSocket: Error: {any}\n", .{err});
+                    return;
+                };
+
+                var wss: WSS = reverb.wss orelse {
+                    std.debug.print("No wss\n", .{});
+                    return;
+                };
+
+                try wss.onMessage(ws, message, ctx);
+                return;
+            }
+
+            if (client.slot >= reverb.request_buffers.len) return error.ContextSlotOutOfRange;
+            const request_buffer = &reverb.request_buffers[client.slot];
+
+            // A single read can carry a fragment of one request, exactly
+            // one, or several pipelined back to back. Buffer the bytes, then
+            // serve every complete request they now contain; whatever is
+            // left over stays for the next read.
+            const max_request_size = Reverb.MAX_RECV_SIZE + helpers.MAX_HEADER_SIZE;
+            request_buffer.append(reverb.arena, client, recv_data, max_request_size) catch |err| {
+                request_buffer.reset(reverb.arena);
+                try respondToFramingError(ctx, err);
+                return err;
+            };
+
+            while (true) {
+                const pending = request_buffer.bytes();
+                if (pending.len == 0) break;
+
+                if (!helpers.isSupportedHttpMethodPrefix(pending)) {
+                    request_buffer.reset(reverb.arena);
+                    try respondToFramingError(ctx, error.MalformedRequest);
+                    return error.MalformedRequest;
+                }
+
+                const request_len = helpers.expectedHttpRequestLength(
+                    pending,
+                    Reverb.MAX_RECV_SIZE,
+                ) catch |err| {
+                    request_buffer.reset(reverb.arena);
+                    try respondToFramingError(ctx, err);
+                    return err;
+                } orelse break; // Incomplete; wait for more bytes.
+
+                // Copied out before serving: a handler may write a response,
+                // and the write path can grow the same buffer underneath us.
+                if (request_len > recv_buf.len) {
+                    request_buffer.reset(reverb.arena);
+                    try respondToFramingError(ctx, error.RequestTooLarge);
+                    return error.RequestTooLarge;
+                }
+                @memcpy(recv_buf[0..request_len], pending[0..request_len]);
+                request_buffer.consume(request_len);
+
+                // Each pipelined request gets a clean context.
+                ctx.clear();
+                ctx.client = client;
+                try serveRequest(reverb, client, ctx, recv_buf[0..request_len]);
+            }
+
+            return;
+        }
+
+        /// Writes the status that corresponds to a framing failure.
+        fn respondToFramingError(ctx: *Context, err: anyerror) !void {
+            const resp = switch (err) {
+                error.BodyTooLarge, error.RequestTooLarge => "HTTP/1.1 413 Request Entity Too Large\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+                error.HeaderTooLarge => "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+                // Chunked bodies are not implemented. 411 tells the client
+                // to send a Content-Length instead of leaving it to guess.
+                error.UnsupportedTransferEncoding => "HTTP/1.1 411 Length Required\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n" ++
+                    "Connection: close\r\n\r\n",
+                else => "HTTP/1.1 400 Bad Request\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+            };
+            ctx.RAW(resp) catch |write_err| return write_err;
+        }
+
+        /// Parses and routes one complete request.
+        ///
+        /// `request_data` holds exactly one request, already framed by
+        /// `handle`.
+        fn serveRequest(
+            reverb: *Reverb,
+            client: *Client,
+            ctx: *Context,
+            request_data: []const u8,
+        ) !void {
+            var ctx_pm = Ctx_pm{};
+            ctx.client.?.msg = request_data;
+
+            // switching to a http_header inside ctx reduces by 10k req/s
+            helpers.parseHeaders(request_data, &ctx_pm, &ctx.http_header) catch |err| {
+                print("Malformed Request: {any} {any}\n", .{ err, error.ParsingHeaders });
+                print("recv_buf[0..recv_data.len] {s}\n", .{request_data});
+                const resp = "HTTP/1.1 404 MALFORMED REQUEST\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n\r\n";
+                ctx.RAW(resp) catch |write_err| {
+                    print("Client Write Error: {any}\n", .{write_err});
+                };
+                return error.MalformedRequest;
+            };
+
+            // we need to consider this;
+            ctx.method = ctx_pm.method;
+            ctx.route = ctx_pm.path;
+            ctx.http_header.path = ctx_pm.path;
+            ctx.http_header.method = ctx_pm.method;
+            const http_header = ctx.http_header;
+
+            if (http_header.content_length > reverb.loom.config.max_body_size) {
+                reverb.logger.err("Request body too large", .{}, null) catch |log_err| {
+                    std.log.err("-----{any}", .{log_err});
+                };
+                const resp = "HTTP/1.1 413 Request body too large\r\n" ++
+                    "Content-Type: text/html\r\n" ++
+                    "Content-Length: 0\r\n";
+                ctx.RAW(resp) catch |write_err| {
+                    print("Client Write Error: {any}\n", .{write_err});
+                };
+                return;
+            }
+
+            if (http_header.content_length > 0) {
+                ctx.content_length = http_header.content_length;
+                if (http_header.body.len < http_header.content_length) return error.MalformedRequest;
+                ctx.payload = http_header.body[0..http_header.content_length];
+                ctx.http_payload = ctx.payload;
+            }
+
+            if (request_data[0] == 'O') {
+                try ctx.OPTIONS();
+                return;
+            }
+
+            if (helpers.findIndex(http_header.connection, 'U') != null) {
+                const result = try WebSocket.handleUpgrade(http_header.ws_client_key, null);
+
+                var response_buf: [512]u8 = undefined;
+                const response = try WebSocket.buildUpgradeResponse(result, &response_buf);
+                try client.write(response);
+
+                const ws: *WebSocket = reverb.arena.create(WebSocket) catch unreachable;
+                ws.* = WebSocket.init(
+                    client,
+                    reverb.arena,
+                    reverb.loom.config.max_body_size,
+                    .{},
+                    // result.deflate_config, // <-- Pass the negotiated config here!
+                ) catch |err| {
+                    print("Error: {any}\n", .{err});
+                    return;
+                };
+
+                client.state = .Idle;
+                client.client_type = .WebSocket;
+                client.ws = ws;
+
+                var wss: WSS = reverb.wss orelse {
+                    std.debug.print("No wss\n", .{});
+                    return;
+                };
+
+                try wss.onConnection(client.ws.?, ctx);
+                return;
+            }
+
+            if (http_header.cookie_str.len > 0) {
+                helpers.parseCookies(ctx, http_header.cookie_str) catch {
+                    // reverb.logger.err("Cookie parsing {any}\n", .{ err }) catch |log_err| {
+                    //     std.log.err("Cookie {any}", .{log_err});
+                    // };
+                };
+            }
+
+            const lookup_route_op = blk: {
+                break :blk helpers.parseParams(ctx, ctx_pm.path) catch |err| {
+                    reverb.logger.err("Params parsing error: {any}", .{err}, null) catch |log_err| {
+                        std.log.err("Lookup {any}", .{log_err});
+                    };
+                    break :blk null; // or some default ParamDetails value
+                };
+            };
+            if (lookup_route_op) |lookup_route| {
+                ctx_pm.path = lookup_route;
+            }
+
+            ctx.http_header = http_header;
+
+            reverb.callRoute(ctx_pm, ctx) catch |err| {
+                reverb.logger.err("{any} Method: {s} Path: {s}", .{ err, ctx_pm.method, ctx_pm.path }, null) catch |log_err| {
+                    std.log.err("Logger Error: {any}", .{log_err});
+                };
+                ctx.ERROR(404, "") catch |write_err| {
+                    return write_err;
+                };
+                return error.BrokenPipe;
+            };
+        }
     };
-
-    ctx = try arena.create(Context);
-    // We goota cheange the whole cookie size thing
-    ctx.* = try Context.init(
-        arena,
-        "",
-        "",
-        null,
-        null,
-        ContentType.None,
-        null,
-        20,
-    );
-    ctx.id = 0;
-
-    instance = target;
-}
-
-pub fn deinit(self: *Reverb) void {
-    for (&self.routes) |*radix| {
-        radix.deinit();
-    }
-    self.loom.deinit();
-    if (Metrics.end_points.GET) |ep_get| {
-        for (ep_get) |elem| {
-            self.arena.free(elem);
-        }
-        self.arena.free(ep_get);
-    }
-    if (Metrics.end_points.POST) |ep_post| {
-        for (ep_post) |elem| {
-            self.arena.free(elem);
-        }
-        self.arena.free(ep_post);
-    }
-    if (Metrics.end_points.PATCH) |ep_patch| {
-        for (ep_patch) |elem| {
-            self.arena.free(elem);
-        }
-        self.arena.free(ep_patch);
-    }
-}
-
-pub fn useWss(reverb: *Reverb, wss_config: WSS.Config) !void {
-    reverb.wss = try WSS.init(wss_config);
-}
-
-fn initTripwire(reverb: *Reverb) !void {
-    reverb.tripwire.init(reverb.arena);
-}
-
-pub fn useTripwire(reverb: *Reverb) !void {
-    reverb.tripwire.init(reverb.arena);
-}
-//
-fn initMetrics(reverb: *Reverb) !void {
-    // try metrics.mapRoutes();
-    try reverb.addRoute("/metrics/allroutes", .GET, getAllRoutes, &[_]MiddleFunc{});
-    try reverb.addRoute("/metrics/healthcheck", .GET, healthCheck, &[_]MiddleFunc{});
-    // try nimbus.addRoute("/metrics/allroutes", "GET", Metrics.allEndPoints, &[_]MiddleFunc{});
-    // try nimbus.addRoute("/metrics/server-status", "GET", dashboard.serverStatus, &[_]MiddleFunc{});
-    // try nimbus.addRoute("/dashboard/request-metrics", "GET", dashboard.requestMetrics, &[_]MiddleFunc{});
-}
-
-pub fn useCors(_: *Reverb, corsConfig: Cors) !void {
-    cors = corsConfig;
-    use_cors = true;
-}
-
-pub fn useStatic(reverb: *Reverb, dir: []const u8) !void {
-    const path = try std.fmt.allocPrint(reverb.arena.*, "/{s}/:file", .{dir});
-    defer reverb.arena.free(path);
-    try reverb.addRoute(path, .GET, staticHandler, &[_]MiddleFunc{});
-}
-
-threadlocal var buf: [524288]u8 = undefined;
-var file_path: [512]u8 = undefined;
-
-// Add a simple in-memory cache for small files
-// const FileCache = struct {
-//     data: []const u8 = ,
-//     content_type: []const u8,
-// }{};
-
-fn staticHandler(static_ctx: *Context) !void {
-    file_path[0] = '.';
-    @memcpy(file_path[1 .. static_ctx.route.len + 1], static_ctx.route);
-    const file = try std.fs.cwd().openFile(file_path[0 .. static_ctx.route.len + 1], .{});
-    defer file.close();
-    const bytes_read = try std.posix.pread(file.handle, &buf, 0);
-    try static_ctx.FILE(buf[0..bytes_read]);
-}
-
-/// This function calls listen on the Reverb instance.
-///
-/// # Returns:
-/// !void.
-pub fn listen(reverb: *Reverb) !void {
-    // try initMetrics(t);
-
-    try reverb.logger.info("Listening on port {any}", .{reverb.loom.config.server_port}, null);
-
-    // try initTripwire(reverb);
-    // defer t.tripwire.deinit();
-
-    if (use_cors) {
-        var str_builder = StringBuilder.new();
-        try cors.?.checkHeadersStr(&str_builder);
-        Context.cors_headers = str_builder.contents[str_builder.start..str_builder.len];
-    }
-
-    try reverb.loom.listen();
-    // const loom = try t.arena.create(Loom);
-    // try loom.new(t.config, t.arena, 0);
-    //
-    // const ctx = try t.arena.create(Context);
-    // ctx.* = try Context.init(
-    //     t.arena,
-    //     "",
-    //     "",
-    //     null,
-    //     null,
-    //     ContentType.None,
-    //     null,
-    //     20,
-    // );
-    // ctx.id = 0;
-    // try Loom.listen(t, &t.loom, ctx);
 }

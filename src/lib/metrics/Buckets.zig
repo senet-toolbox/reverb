@@ -64,7 +64,7 @@ pub fn loop() void {
             tether.instance.logger.err("Failed to stringify {any}", .{err}) catch return;
             return;
         };
-        _ =  th_client.lpush(timestamp_key, .{ .json = json_bucket }) catch |err| {
+        _ = th_client.lpush(timestamp_key, .{ .json = json_bucket }) catch |err| {
             tether.instance.logger.err("Failed to set {any}", .{err}) catch return;
             return;
         };

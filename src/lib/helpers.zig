@@ -64,7 +64,20 @@ pub const ContentType = enum {
     MultiForm,
     JSON,
     WASM,
+
+    pub fn toString(self: ContentType) []const u8 {
+        return switch (self) {
+            .None => "",
+            .Text => "text/plain; charset=utf-8",
+            .Form => "application/x-www-form-urlencoded",
+            .MultiForm => "multipart/form-data",
+            .JSON => "application/json",
+            .WASM => "application/wasm",
+        };
+    }
 };
+
+pub const MAX_HEADER_SIZE: usize = 16 * 1024;
 
 pub const HTTPHeader = struct {
     request_line: []const u8 = "",
@@ -75,22 +88,25 @@ pub const HTTPHeader = struct {
     user_agent: []const u8 = "",
     cookie: []const u8 = "",
     cookie_str: []const u8 = "",
-    content_type: ContentType = ContentType.None,
+    content_type: ContentType = ContentType.Text,
+    content_encoding: []const u8 = "",
     content_length: usize = 0,
     connection: []const u8 = "",
     path: []const u8 = "",
     body: []const u8 = "",
     // cookies: std.ArrayList([]const u8),
     method: []const u8 = "",
+    authorization: []const u8 = "",
     accept_language: []const u8 = "",
     accept_encoding: []const u8 = "",
     accept_control_request_method: []const u8 = "",
     accept_control_request_headers: []const u8 = "",
+    sec_websocket_extensions: []const u8 = "",
     boundary: ?[]const u8 = "",
     ws_version: []const u8 = "",
     ws_client_key: []const u8 = "",
     referer: []const u8 = "",
-    _buffer: [8192 * 4]u8 = undefined,
+    _buffer: [MAX_HEADER_SIZE]u8 = undefined,
 
     pub fn init(_: *std.mem.Allocator) !HTTPHeader {
         return HTTPHeader{
@@ -103,6 +119,8 @@ pub const HTTPHeader = struct {
             // .cookies = std.ArrayList([]const u8).init(arena.*),
             .method = "",
             .content_type = ContentType.None,
+            .content_encoding = "",
+            .authorization = "",
             .accept_language = "",
             .accept_encoding = "",
             .accept_control_request_method = null,
@@ -127,15 +145,20 @@ pub const HTTPHeader = struct {
     }
 };
 
-pub fn generateSessionId() ![]const u8 {
+/// Generates a random session id. Caller owns the returned memory.
+///
+/// Takes an allocator rather than reaching for `std.heap.c_allocator`,
+/// which forced a libc dependency and left every id it produced leaked.
+pub fn generateSessionId(allocator: std.mem.Allocator) ![]const u8 {
     var uuid_buf: [36]u8 = undefined;
     newV4().to_string(&uuid_buf);
 
-    const hash = try convertStringToSlice(&uuid_buf, std.heap.c_allocator);
-    return hash;
+    return convertStringToSlice(&uuid_buf, allocator);
 }
 
-pub fn parseSession(recv_data: []const u8) ![]const u8 {
+/// Returns the session id from the request's cookies, or a freshly
+/// generated one. Only the generated case allocates, from `allocator`.
+pub fn parseSession(allocator: std.mem.Allocator, recv_data: []const u8) ![]const u8 {
     const cookie = parseCookie(recv_data);
     if (cookie != null) {
         var cookie_itr = std.mem.splitSequence(u8, cookie.?, "=");
@@ -152,7 +175,7 @@ pub fn parseSession(recv_data: []const u8) ![]const u8 {
             cookie_itr.next();
         }
     }
-    return generateSessionId();
+    return generateSessionId(allocator);
 }
 
 fn parseCookie(header: []const u8) ?[]const u8 {
@@ -212,6 +235,100 @@ pub fn findIndex(haystack: []const u8, needle: u8) ?usize {
         if (haystack[i] == needle) return i;
     }
     return null;
+}
+
+pub fn isSupportedHttpMethodPrefix(payload: []const u8) bool {
+    if (payload.len == 0) return true;
+
+    const methods = [_][]const u8{
+        "GET ",
+        "POST ",
+        "PUT ",
+        "DELETE ",
+        "OPTIONS ",
+        "HEAD ",
+        "CONNECT ",
+        "TRACE ",
+        "PATCH ",
+    };
+
+    for (methods) |method| {
+        const prefix_len = @min(payload.len, method.len);
+        if (std.mem.eql(u8, payload[0..prefix_len], method[0..prefix_len])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn parseHeaderContentLength(headers: []const u8) !usize {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch return error.MalformedRequest;
+    }
+
+    return 0;
+}
+
+/// True when the head declares a transfer coding this server cannot frame.
+///
+/// `identity` is excluded because it means "no encoding applied" and so
+/// leaves `Content-Length` in charge of framing.
+fn hasUnsupportedTransferEncoding(headers: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next(); // request line
+
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) continue;
+
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(value, "identity")) continue;
+        return true;
+    }
+
+    return false;
+}
+
+/// How many bytes make up the first complete request in `payload`, or null
+/// if it has not all arrived yet.
+///
+/// This is the only thing standing between one request's bytes and the
+/// next, so getting it wrong either stalls a connection or lets a body be
+/// read as a following request.
+pub fn expectedHttpRequestLength(payload: []const u8, max_body_size: usize) !?usize {
+    const headers_end = findCRLFCRLF(payload) orelse {
+        if (payload.len > MAX_HEADER_SIZE) return error.HeaderTooLarge;
+        return null;
+    };
+    const header_len = headers_end + 4;
+    if (header_len > MAX_HEADER_SIZE) return error.HeaderTooLarge;
+
+    // Refused rather than ignored. A chunked body framed as zero-length
+    // would leave the chunk data in the buffer to be parsed as the next
+    // request on a keep-alive connection — request smuggling. The same
+    // applies when both Transfer-Encoding and Content-Length are present,
+    // since two parties can then disagree about which one frames the body.
+    if (hasUnsupportedTransferEncoding(payload[0..headers_end])) {
+        return error.UnsupportedTransferEncoding;
+    }
+
+    const content_length = try parseHeaderContentLength(payload[0..headers_end]);
+    if (content_length > max_body_size) return error.BodyTooLarge;
+
+    const total_len = header_len + content_length;
+    if (payload.len < total_len) return null;
+
+    return total_len;
 }
 
 pub fn findCRLFCRLF(payload: []const u8) ?usize {
@@ -369,6 +486,7 @@ const HeaderLookup = struct {
         table.first_char['O'] = 8; // Origin
         table.first_char['R'] = 9; // Referer
         table.first_char['S'] = 10; // Referer
+        table.first_char['s'] = 11; // sec-ch-ua
 
         return table;
     }
@@ -471,147 +589,182 @@ const MethodTrie = struct {
 // GET /ping HTTP/1.1
 // Host: 127.0.0.1:8080
 
-var http_header: HTTPHeader = HTTPHeader{};
-pub fn parseHeaders(new_payload: []const u8, ctx_pm: *Ctx_pm) !*HTTPHeader {
-    http_header = HTTPHeader{};
-    @memcpy(http_header._buffer[0..new_payload.len], new_payload);
-    var payload = http_header._buffer[0..new_payload.len];
-    // Allocate space for the copy (same length as original)
-    var i: usize = 0;
-    var line_start: usize = 0;
-
-    if (std.mem.indexOf(u8, new_payload, "Accept-Encoding:")) |index| {
-        const start = index + 16;
-        var end = std.mem.indexOf(u8, new_payload[start..], "\r\n") orelse return error.MalformedRequest;
-        end += start;
-        http_header.accept_encoding = new_payload[start..end];
+/// Maps a method name to the shared constant for it, so callers comparing
+/// `ctx_pm.method` can compare pointers for the common verbs. Returns null
+/// for anything unrecognised, and the caller keeps the original slice.
+fn canonicalMethod(method: []const u8) ?[]const u8 {
+    const table = [_][]const u8{
+        commonStrings.get,
+        commonStrings.post,
+        commonStrings.patch,
+        commonStrings.delete,
+        commonStrings.update,
+        commonStrings.options,
+    };
+    for (table) |candidate| {
+        if (std.mem.eql(u8, method, candidate)) return candidate;
     }
+    return null;
+}
 
-    switch (HeaderLookup.first_char[payload[0]]) {
-        1 => ctx_pm.method = commonStrings.get,
-        2 => ctx_pm.method = switch (payload[1]) {
-            'O' => commonStrings.post,
-            else => commonStrings.patch,
-        },
-        3 => ctx_pm.method = commonStrings.delete,
-        4 => switch (payload[1]) {
-            'P' => ctx_pm.method = commonStrings.update,
-            else => {},
-        },
-        else => {},
-    }
-    // std.debug.print("We check payload {s}\n", .{payload});
-    // Find CRLF with SIMD+word scan
-    const request_line_sentinal = findCRLF(payload);
+/// Classifies a Content-Type header value.
+///
+/// Unknown types map to `.None` rather than being treated as impossible —
+/// the value comes from the client, so any byte sequence can appear here.
+fn classifyContentType(value: []const u8) ContentType {
+    // Compare against the media type only, ignoring any parameters such as
+    // `; charset=utf-8` and any leading whitespace.
+    const media_end = std.mem.indexOfAny(u8, value, "; \t") orelse value.len;
+    const media = value[0..media_end];
 
-    // Direct path assignment (no copy)
-    const request_line_value = payload[ctx_pm.method.len + 1 .. request_line_sentinal];
-    ctx_pm.path = request_line_value[0 .. request_line_sentinal - 13];
+    if (std.ascii.eqlIgnoreCase(media, "application/json")) return .JSON;
+    if (std.ascii.eqlIgnoreCase(media, "application/wasm")) return .WASM;
+    if (std.ascii.eqlIgnoreCase(media, "application/x-www-form-urlencoded")) return .Form;
+    if (media.len >= 5 and std.ascii.eqlIgnoreCase(media[0..5], "text/")) return .Text;
+    if (media.len >= 10 and std.ascii.eqlIgnoreCase(media[0..10], "multipart/")) return .MultiForm;
+    return .None;
+}
 
-    i = request_line_sentinal + 1;
-    line_start = i + 1;
+/// Splits a header line into its name and value.
+///
+/// Returns null when the line carries no colon, which makes it a malformed
+/// field the caller should skip rather than a fatal error.
+fn splitHeaderLine(line: []const u8) ?struct { name: []const u8, value: []const u8 } {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    return .{
+        .name = std.mem.trim(u8, line[0..colon], " \t"),
+        .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+    };
+}
 
-    const last = findCRLFCRLF(payload) orelse return error.MalformedRequest;
-    http_header.body = payload[last + 4 ..];
-    while (i < last) : (i += 1) {
-        const c = payload[i];
-        if (c != ' ') continue;
+//wrk test payload is
+// GET /ping HTTP/1.1
+// Host: 127.0.0.1:8080
 
-        // Quick lookup using pre-computed table
-        const header_type = HeaderLookup.first_char[payload[line_start]];
-        if (header_type == 0) {
-            i = findCRLF(payload[i..]) + i + 1;
-            continue;
-        }
+/// Parses a complete HTTP request head into `ctx_pm` and `http_header`.
+///
+/// `new_payload` must hold the whole head — `expectedHttpRequestLength`
+/// establishes that before this is called. Everything here is driven by
+/// bytes a client chose, so every field is treated as untrusted: a
+/// malformed request returns an error and never reads out of bounds.
+///
+/// The head is copied into `http_header._buffer`, and the slices stored on
+/// `ctx_pm` and `http_header` point into that buffer, so they stay valid for
+/// as long as `http_header` does. `body` is the exception: it points into
+/// `new_payload`.
+pub fn parseHeaders(new_payload: []const u8, ctx_pm: *Ctx_pm, http_header: *HTTPHeader) !void {
+    const headers_end = findCRLFCRLF(new_payload) orelse return error.MalformedRequest;
+    const header_len = headers_end + 4;
+    if (header_len > http_header._buffer.len) return error.HeaderTooLarge;
 
-        const sentinal = findCRLF(payload[i..]) + i;
-        const value = payload[i + 1 .. sentinal];
+    @memcpy(http_header._buffer[0..header_len], new_payload[0..header_len]);
+    const payload = http_header._buffer[0..header_len];
 
-        // Use computed goto pattern for better performance than switch
-        switch (header_type) {
-            4 => switch (payload[line_start + 1]) {
-                's' => http_header.user_agent = value,
-                else => {},
+    // The body lives in the caller's payload, past the head this function copied.
+    http_header.body = new_payload[header_len..];
+
+    // ---- Request line -----------------------------------------------------
+    //
+    // `findCRLF` returns the slice length when there is no CR at all. That
+    // cannot happen here because `findCRLFCRLF` already matched, but the
+    // bound is asserted rather than assumed.
+    const request_line_end = findCRLF(payload);
+    if (request_line_end >= payload.len) return error.MalformedRequest;
+    const request_line = payload[0..request_line_end];
+
+    const method_end = std.mem.indexOfScalar(u8, request_line, ' ') orelse
+        return error.MalformedRequest;
+    const method = request_line[0..method_end];
+    if (method.len == 0) return error.MalformedRequest;
+
+    const after_method = request_line[method_end + 1 ..];
+    // A missing HTTP version leaves the rest of the line as the path, which
+    // keeps HTTP/0.9-style requests parseable instead of crashing.
+    const path_end = std.mem.indexOfScalar(u8, after_method, ' ') orelse after_method.len;
+    const path = after_method[0..path_end];
+    if (path.len == 0) return error.MalformedRequest;
+
+    ctx_pm.method = canonicalMethod(method) orelse method;
+    ctx_pm.path = path;
+    http_header.request_line = request_line;
+
+    // ---- Header fields ----------------------------------------------------
+    //
+    // Dispatch on the first byte of the field name to avoid comparing every
+    // candidate for every line, then confirm with a full case-insensitive
+    // match so a truncated or unexpected name cannot be mistaken for a
+    // longer one it merely shares a prefix with.
+    var lines = std.mem.splitSequence(u8, payload[request_line_end + 2 .. headers_end], "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const field = splitHeaderLine(line) orelse continue;
+        const name = field.name;
+        const value = field.value;
+        if (name.len == 0) continue;
+
+        switch (std.ascii.toUpper(name[0])) {
+            'H' => {
+                if (std.ascii.eqlIgnoreCase(name, "Host")) http_header.host = value;
             },
-            5 => {
-                http_header.host = value;
+            'U' => {
+                if (std.ascii.eqlIgnoreCase(name, "User-Agent")) {
+                    http_header.user_agent = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Upgrade")) {
+                    http_header.upgrade = value;
+                }
             },
-            6 => switch (payload[line_start + 2]) {
-                'o' => http_header.cookie_str = value,
-                'n' => {
-                    switch (payload[line_start + 8]) {
-                        // Here we check if we are looking at Content-Type or Content-Length
-                        'l', 'L' => {
-                            http_header.content_length = std.fmt.parseInt(usize, value, 10) catch 0;
-                        },
-                        't', 'T' => {
-                            type_sw: switch (value[0]) {
-                                'a' => {
-                                    if (value[12] == 'x') continue :type_sw 'x';
-                                    if (value[12] == 'j') continue :type_sw 'j';
-                                    if (value[12] == 'w') continue :type_sw 'w';
-                                },
-                                't' => {
-                                    http_header.content_type = ContentType.Text;
-                                },
-                                'x' => {
-                                    http_header.content_type = ContentType.Form;
-                                },
-                                'j' => {
-                                    http_header.content_type = ContentType.JSON;
-                                },
-                                'm' => {
-                                    http_header.content_type = ContentType.MultiForm;
-                                },
-                                'w' => {
-                                    http_header.content_type = ContentType.WASM;
-                                },
-                                else => unreachable,
-                            }
-                        },
-                        'o' => {
-                            http_header.connection = value;
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
+            'C' => {
+                if (std.ascii.eqlIgnoreCase(name, "Cookie")) {
+                    http_header.cookie_str = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+                    // A Content-Length that does not fit a usize, or is not a
+                    // number at all, is a malformed request rather than a
+                    // body of length zero: treating it as zero would let a
+                    // request smuggle its body into the next one on a
+                    // keep-alive connection.
+                    http_header.content_length = std.fmt.parseInt(usize, value, 10) catch
+                        return error.MalformedRequest;
+                } else if (std.ascii.eqlIgnoreCase(name, "Content-Type")) {
+                    http_header.content_type = classifyContentType(value);
+                } else if (std.ascii.eqlIgnoreCase(name, "Content-Encoding")) {
+                    http_header.content_encoding = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Connection")) {
+                    http_header.connection = value;
+                }
             },
-            7 => if (line_start + 7 < payload.len) switch (payload[line_start + 7]) {
-                'L' => http_header.accept_language = value,
-                'E' => {},
-                'C' => if (line_start + 23 < payload.len) switch (payload[line_start + 23]) {
-                    'M' => http_header.accept_control_request_method = value,
-                    'H' => http_header.accept_control_request_headers = value,
-                    else => {},
-                },
-                else => {},
+            'A' => {
+                if (std.ascii.eqlIgnoreCase(name, "Authorization")) {
+                    http_header.authorization = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Accept")) {
+                    http_header.accept = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Accept-Language")) {
+                    http_header.accept_language = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Accept-Encoding")) {
+                    http_header.accept_encoding = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Access-Control-Request-Method")) {
+                    http_header.accept_control_request_method = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Access-Control-Request-Headers")) {
+                    http_header.accept_control_request_headers = value;
+                }
             },
-            8 => switch (payload[line_start + 1]) {
-                'r' => {
-                    http_header.origin = value;
-                },
-                'P' => {
-                    http_header.method = commonStrings.options;
-                },
-                else => {},
+            'O' => {
+                if (std.ascii.eqlIgnoreCase(name, "Origin")) http_header.origin = value;
             },
-            9 => http_header.referer = value,
-            10 => {
-                if (payload[line_start + 4] == 'W') {
-                    if (payload[line_start + 14] == 'K') {
-                        http_header.ws_client_key = value;
-                    }
+            'R' => {
+                if (std.ascii.eqlIgnoreCase(name, "Referer")) http_header.referer = value;
+            },
+            'S' => {
+                if (std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Key")) {
+                    http_header.ws_client_key = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Version")) {
+                    http_header.ws_version = value;
+                } else if (std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Extensions")) {
+                    http_header.sec_websocket_extensions = value;
                 }
             },
             else => {},
         }
-
-        i = sentinal + 1;
-        line_start = i + 1;
     }
-
-    return &http_header;
 }
 
 pub fn parseParams(ctx: *Context, url: []const u8) !?[]const u8 {
@@ -868,4 +1021,217 @@ pub const zero: UUID = .{ .bytes = .{0} ** 16 };
 // Convenience function to return a new v4 UUID.
 pub fn newV4() UUID {
     return UUID.init();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// `HTTPHeader` embeds a 16 KiB buffer, which is too large to sit on the test
+// stack comfortably, so parses run against a heap-allocated one.
+fn parseForTest(payload: []const u8, ctx_pm: *Ctx_pm) !void {
+    const header = try testing.allocator.create(HTTPHeader);
+    defer testing.allocator.destroy(header);
+    header.* = .{};
+    return parseHeaders(payload, ctx_pm, header);
+}
+
+// Every one of these is a request a client can send. Whatever the parser
+// decides to do with them, it has to be reached by `return`ing an error
+// rather than by reading out of bounds or hitting `unreachable` — either of
+// which takes the whole server down.
+test "hostile requests are rejected rather than crashing the parser" {
+    const hostile = [_][]const u8{
+        // Unknown verb: the method lookup leaves `method` empty, so the
+        // request-line slice is computed from a length that was never set.
+        "XYZ / HTTP/1.1\r\nHost: a\r\n\r\n",
+        // Request line shorter than the fallback offset used when no space
+        // follows the path.
+        "G\r\n\r\n",
+        "GET\r\n\r\n",
+        "\r\n\r\n",
+        // A header line whose value is empty, indexed at [0] and [12].
+        "GET / HTTP/1.1\r\nContent-Type:\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Type: \r\n\r\n",
+        // Content-Type shorter than the offsets the type switch reads.
+        "GET / HTTP/1.1\r\nContent-Type: a\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Type: applicat\r\n\r\n",
+        // A Content-Type the switch has no arm for.
+        "GET / HTTP/1.1\r\nContent-Type: zzz/unknown\r\n\r\n",
+        // Truncated header names, indexed well past their end.
+        "GET / HTTP/1.1\r\nC: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nCo: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nCon: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nA: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nS: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nSec-W: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nO: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nU: x\r\n\r\n",
+        // Non-numeric and overflowing Content-Length.
+        "GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+        "GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+        // No space anywhere in the request line.
+        "GET\r\nHost: a\r\n\r\n",
+        // Path missing entirely.
+        "GET  HTTP/1.1\r\nHost: a\r\n\r\n",
+        // A lone space as the whole request.
+        " \r\n\r\n",
+    };
+
+    for (hostile) |payload| {
+        var ctx_pm = Ctx_pm{};
+        // Errors are fine. Crashes are not.
+        parseForTest(payload, &ctx_pm) catch continue;
+    }
+}
+
+test "a well-formed request parses into its parts" {
+    var ctx_pm = Ctx_pm{};
+    const header = try testing.allocator.create(HTTPHeader);
+    defer testing.allocator.destroy(header);
+    header.* = .{};
+
+    const payload =
+        "GET /users/42 HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "User-Agent: test-agent\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "\r\n" ++
+        "hello";
+
+    try parseHeaders(payload, &ctx_pm, header);
+
+    try testing.expectEqualStrings("GET", ctx_pm.method);
+    try testing.expectEqualStrings("/users/42", ctx_pm.path);
+    try testing.expectEqualStrings("example.com", header.host);
+    try testing.expectEqualStrings("test-agent", header.user_agent);
+    try testing.expectEqual(@as(usize, 5), header.content_length);
+    try testing.expectEqual(ContentType.JSON, header.content_type);
+    try testing.expectEqualStrings("hello", header.body);
+}
+
+// A seeded mutation sweep. `std.testing.fuzz` needs the dedicated fuzz
+// runner, so this stands in for it: deterministic, runs on every `zig build
+// test`, and covers the same class of defect — a byte sequence the parser
+// did not anticipate reaching an unchecked index.
+test "mutated requests never crash the parser" {
+    const seeds = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+        "POST /a/b?c=d HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        "OPTIONS / HTTP/1.1\r\nOrigin: http://x\r\nAccess-Control-Request-Method: GET\r\n\r\n",
+        "GET / HTTP/1.1\r\nCookie: a=1; b=2\r\nReferer: http://x\r\n\r\n",
+    };
+
+    // Bytes chosen to land on the structural characters the parser keys off.
+    const interesting = [_]u8{ 0, '\r', '\n', ' ', ':', '/', '?', ';', '.', 0x80, 0xff, 'A' };
+
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+
+    var buf: [1024]u8 = undefined;
+    for (seeds) |seed| {
+        for (0..2000) |_| {
+            if (seed.len > buf.len) continue;
+            const payload = buf[0..seed.len];
+            @memcpy(payload, seed);
+
+            // Apply a handful of single-byte edits, then truncate at a random
+            // point so partial heads get exercised alongside mutated ones.
+            const edits = random.uintLessThan(usize, 4) + 1;
+            for (0..edits) |_| {
+                const pos = random.uintLessThan(usize, payload.len);
+                payload[pos] = switch (random.uintLessThan(u8, 3)) {
+                    0 => interesting[random.uintLessThan(usize, interesting.len)],
+                    1 => random.int(u8),
+                    else => payload[pos] ^ (@as(u8, 1) << random.int(u3)),
+                };
+            }
+
+            const truncated = payload[0 .. random.uintLessThan(usize, payload.len) + 1];
+
+            var ctx_pm = Ctx_pm{};
+            // Any error is acceptable; reaching this line at all is the point.
+            parseForTest(truncated, &ctx_pm) catch continue;
+        }
+    }
+}
+
+// `expectedHttpRequestLength` decides how many bytes make up one request, so
+// a wrong answer either stalls a connection or lets one request's bytes be
+// read as the next one's.
+test "expectedHttpRequestLength frames requests correctly" {
+    const max_body = 1024;
+
+    // Incomplete heads report "not yet".
+    try testing.expectEqual(@as(?usize, null), try expectedHttpRequestLength("GET / HTTP/1.1\r\n", max_body));
+    try testing.expectEqual(@as(?usize, null), try expectedHttpRequestLength("", max_body));
+
+    // A complete head with no body is exactly its own length.
+    const no_body = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    try testing.expectEqual(@as(?usize, no_body.len), try expectedHttpRequestLength(no_body, max_body));
+
+    // With a body, the head plus the declared length.
+    const with_body = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    try testing.expectEqual(@as(?usize, with_body.len), try expectedHttpRequestLength(with_body, max_body));
+
+    // A partial body still reports "not yet".
+    try testing.expectEqual(
+        @as(?usize, null),
+        try expectedHttpRequestLength("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhel", max_body),
+    );
+
+    // Two pipelined requests report only the first, so the second is left in
+    // the buffer rather than being swallowed.
+    const first = "GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
+    const pipelined = first ++ "GET /b HTTP/1.1\r\nHost: a\r\n\r\n";
+    try testing.expectEqual(@as(?usize, first.len), try expectedHttpRequestLength(pipelined, max_body));
+
+    // Oversized bodies and heads are refused.
+    try testing.expectError(
+        error.BodyTooLarge,
+        expectedHttpRequestLength("POST / HTTP/1.1\r\nContent-Length: 99999\r\n\r\n", max_body),
+    );
+    const giant = "GET / HTTP/1.1\r\n" ++ ("X-Pad: 0123456789\r\n" ** 1200);
+    try testing.expectError(error.HeaderTooLarge, expectedHttpRequestLength(giant, max_body));
+}
+
+// `Transfer-Encoding` is not implemented, and the danger is not that it is
+// missing but that it is ignored: a chunked body would be framed as
+// zero-length, leaving the chunk data in the buffer to be read as the
+// *next* request on a keep-alive connection. That is request smuggling.
+// Both these cases must be refused.
+test "a chunked request is refused rather than mis-framed" {
+    const max_body = 1024;
+
+    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        max_body,
+    ));
+
+    // Header name casing is not significant.
+    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\ntransfer-encoding: CHUNKED\r\n\r\n0\r\n\r\n",
+        max_body,
+    ));
+
+    // `identity` is the one encoding that means "no encoding", so it is
+    // not a framing hazard and stays allowed.
+    const identity = "POST / HTTP/1.1\r\nTransfer-Encoding: identity\r\nContent-Length: 2\r\n\r\nhi";
+    try testing.expectEqual(
+        @as(?usize, identity.len),
+        try expectedHttpRequestLength(identity, max_body),
+    );
+}
+
+// Sending both headers is the classic smuggling setup: two intermediaries
+// disagree about which one frames the body.
+test "a request with both Transfer-Encoding and Content-Length is refused" {
+    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        1024,
+    ));
 }

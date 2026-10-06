@@ -29,7 +29,7 @@ pub fn checkHeadersStr(cors: *Cors, builder: *String) !void {
         cors.cors_headers.methods,
         builder,
     )) {
-        builder.append_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+        builder.append_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, PATCH");
         builder.append_str("\r\n");
         // The default is to omit content-type if not provided because
         // "application/octet-stream" is redundant.
@@ -98,7 +98,7 @@ fn emitOverridableHeader(
 pub fn checkHeaders(cors: *Cors, reply_builder: *ReplyBuilder) !void {
     if (try emitOverridableHeader_("Access-Control-Allow-Methods: ", cors.cors_headers.methods, reply_builder)) {
         try reply_builder.writeHeaderPrefix("Access-Control-Allow-Methods: ");
-        try reply_builder.writeHeaderValue("GET, POST, PUT, DELETE, OPTIONS");
+        try reply_builder.writeHeaderValue("GET, POST, PUT, DELETE, OPTIONS, PATCH");
         // The default is to omit content-type if not provided because
         // "application/octet-stream" is redundant.
     }

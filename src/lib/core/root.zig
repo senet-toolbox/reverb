@@ -1,4 +1,6 @@
 const std = @import("std");
+const loom = @import("loom");
+const Time = loom.Time;
 
 pub const EncodingKey = @import("JWT.zig").EncodingKey;
 
@@ -119,7 +121,7 @@ pub const Validation = struct {
     // returns "now" in seconds, relative to UTC 1970-01-01
     now: *const fn () u64 = struct {
         fn func() u64 {
-            return @intCast(std.time.timestamp());
+            return @intCast(Time.timestamp());
         }
     }.func,
     // skip verification of the secret - use this when you only want to view the claims from a token

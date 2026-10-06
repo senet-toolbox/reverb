@@ -18,6 +18,13 @@ pub fn build(b: *std.Build) void {
     // This creates a "module", which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Every executable or library we compile will be based on one or more modules.
+    // Reverb reaches libc in a few places -- `std.heap.c_allocator` in
+    // treehouse.zig and context.zig, 29 call sites in total. Until those are
+    // converted to take an allocator, libc has to be declared.
+    //
+    // This was previously satisfied by accident: the pg dependency linked
+    // libc, so removing pg broke the Linux build while macOS kept working,
+    // because libSystem is linked there regardless. See context.md.
     const mod = b.addModule("reverb", .{
         // `root_source_file` is the Zig "entry point" of the module. If a module
         // only contains e.g. external object files, you can make this `null`.
@@ -27,6 +34,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // the executable from your call to b.addExecutable(...)
 
     const loom = b.dependency("loom", .{
         .target = target,
@@ -50,25 +59,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "loom", .module = loom_mod },
         },
     });
-    //
-    // // Modules can depend on one another using the `std.Build.Module.addImport` function.
-    // // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
-    // // file path. In this case, we set up `exe_mod` to import `lib_mod`.
-    // exe_mod.addImport("reverb_lib", lib_mod);
-    //
-    // // Now, we will create a static library based on the module we created above.
-    // // This creates a `std.Build.Step.Compile`, which is the build step responsible
-    // // for actually invoking the compiler.
-    // const lib = b.addLibrary(.{
-    //     .linkage = .static,
-    //     .name = "reverb",
-    //     .root_module = lib_mod,
-    // });
-    //
-    // // This declares intent for the library to be installed into the standard
-    // // location when the user invokes the "install" step (the default step when
-    // // running `zig build`).
-    //
+
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
     const exe = b.addExecutable(.{
@@ -104,4 +95,79 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `run` step rather than the default, which is "install".
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    // ------------------------------------------------------------------
+    // The README quickstart, compiled as part of the normal build so the
+    // first code a reader runs cannot silently rot.
+    // ------------------------------------------------------------------
+    const readme_example = b.addExecutable(.{
+        .name = "readme_quickstart",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/readme_quickstart.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "reverb", .module = mod },
+            },
+        }),
+    });
+    const check_readme = b.step("check-readme", "Compile the README quickstart");
+    check_readme.dependOn(&readme_example.step);
+
+    // ------------------------------------------------------------------
+    // Tests.
+    //
+    // Zig only collects `test` blocks from the *root* file of a test
+    // binary, so every file carrying tests has to be reachable through an
+    // explicit `_ = @import(...)` from the root. `src/root.zig` does that
+    // for the unit tests; `tests/integration.zig` drives a real server
+    // over real sockets.
+    // ------------------------------------------------------------------
+    const unit_tests = b.addTest(.{
+        .name = "unit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "loom", .module = loom_mod },
+            },
+        }),
+    });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    run_unit_tests.has_side_effects = true;
+
+    const integration_tests = b.addTest(.{
+        .name = "integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "reverb", .module = mod },
+                .{ .name = "loom", .module = loom_mod },
+            },
+        }),
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.has_side_effects = true;
+
+    const test_unit_step = b.step("test-unit", "Run unit tests");
+    test_unit_step.dependOn(&run_unit_tests.step);
+
+    const test_integration_step = b.step("test-integration", "Run integration tests");
+    test_integration_step.dependOn(&run_integration_tests.step);
+
+    // Compiles the test binaries without running them, so a
+    // cross-compiled target can be checked for build errors the exe alone
+    // would not surface. An undeclared libc dependency lived only in the
+    // test graph once and `zig build -Dtarget=...` missed it, because the
+    // install step builds the executable and not the tests.
+    const test_compile_step = b.step("test-compile", "Compile the tests without running them");
+    test_compile_step.dependOn(&unit_tests.step);
+    test_compile_step.dependOn(&integration_tests.step);
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 }

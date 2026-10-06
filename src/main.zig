@@ -1,57 +1,42 @@
-// //! By convention, main.zig is where your main function lives in the case that
-// //! you are building an executable. If you are making a library, the convention
-// //! is to delete this file and start with root.zig instead.
-//
-// const std = @import("std");
+//! A minimal Reverb server.
+//!
+//! Run with `zig build run`, then `curl http://127.0.0.1:8080/`.
+
 const std = @import("std");
-const loompkg = @import("loom");
 const Server = @import("reverb").Server;
 const Context = @import("reverb").Context;
-const Websocket = loompkg.WebSocket;
 
 fn ping(ctx: *Context) !void {
-    try ctx.STRING("Hello from Reverb!");
+    try ctx.STRING("SUCCESS");
 }
 
-fn onConnection(ws: *Websocket) !void {
-    std.debug.print("onConnection\n", .{});
-    try ws.sendText("Hello from Reverb!");
-}
-
-fn onMessage(ws: *Websocket, message: Websocket.Message) !void {
-    switch (message) {
-        .Text => |text| {
-            std.debug.print("Text: {s}\n", .{text});
-        },
-        .Binary => |binary| {
-            std.debug.print("Binary: {any}\n", .{binary});
-        },
-        .Pong => |pong| {
-            std.debug.print("Pong: {any}\n", .{pong});
-        },
-        .Close => |close| {
-            std.debug.print("Close: {any}\n", .{close});
-        },
-        else => {},
-    }
-    try ws.sendText("This is onMessage send");
-}
+const Config = struct {
+    port: u16 = 8080,
+    max: usize = 1024,
+    max_body_size: usize = 1024 * 1024 * 10,
+};
 
 pub fn main() !void {
-    var allocator = std.heap.page_allocator;
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
 
-    var server: Server = undefined;
-    const loom_config = Server.Config{
-        .max = 1024,
-    };
-    try server.new(loom_config, &allocator, null);
+    // Everything the server allocates lives as long as the server does, so
+    // one arena is freed in a single step at shutdown.
+    var arena = std.heap.ArenaAllocator.init(gpa_state.allocator());
+    defer arena.deinit();
 
-    try server.useWss(.{
-        .onConnection = onConnection,
-        .onMessage = onMessage,
-        .max_body_size = 1024,
-    });
+    var server: Server(Config) = undefined;
+    try server.new(.{}, arena.allocator());
+    defer server.deinit();
+
+    // Lets SIGTERM and SIGINT return from `listen` so the deferred
+    // `deinit` above actually runs, instead of the process being killed
+    // part-way through a response.
+    try server.installSignalHandlers();
 
     try server.get("/", ping, &.{});
+
+    std.log.info("listening on http://127.0.0.1:8080/", .{});
     try server.listen();
+    std.log.info("shut down cleanly", .{});
 }

@@ -17,17 +17,9 @@ const dom = @import("core/simdjson/dom.zig");
 const posix = std.posix;
 const loompkg = @import("loom");
 const xsuspend = loompkg.xsuspend;
+const Time = loompkg.Time;
 
 pub const json_type = []const u8;
-
-fn tlsWrite(_: i32, _: []const u8) void {
-    // TLSStruct.tlsWrite(ssl, resp);
-}
-fn httpWrite(client: *Client, resp: []const u8) !void {
-    try client.writer.fillWriteBuffer(resp);
-    _ = try client.writeMessage();
-    // _ = try posix.write(client.socket, resp);
-}
 
 const CtxError = error{
     MalformedFormContentType,
@@ -66,8 +58,9 @@ pub const Param = struct {
 
 pub const Self = @This();
 id: usize = 10000,
-arena: *std.mem.Allocator,
-http_header: *helpers.HTTPHeader = undefined,
+arena: std.mem.Allocator,
+payload: []const u8 = undefined,
+http_header: helpers.HTTPHeader = .{},
 req_params_index: usize = 0,
 params: []Param = undefined, // Array of key-value pairs for URL parameters
 req_query_params_index: usize = 0,
@@ -75,26 +68,20 @@ query_params: []Param = undefined, // Array of key-value pairs for query paramet
 form_params: *std.StringHashMap([]const u8) = undefined, // Array of key-value pairs for form data
 method: []const u8,
 route: []const u8,
-// headers: std.StringHashMap([]const u8) = undefined,
-// setValues: std.StringHashMap([]const u8) = undefined,
-payload: [524288]u8 = undefined,
-// payload_str: []const u8 = undefined,
 content_length: usize = 0,
 http_payload: []const u8,
 content_type: helpers.ContentType = helpers.ContentType.None,
 client: ?*Client = null,
-// ssl: ?i32 = null,
-cookies: std.StringHashMap(Cookie) = undefined,
+cookies: *std.StringHashMap(Cookie) = undefined,
 req_cookie_index: usize = 0,
 req_cookies: []Cookie = undefined,
-// sticky_session: ?[]const u8 = null,
-// boundary: ?[]const u8 = null,
-multi_form: MultiForm = undefined,
-reply_builder: String = undefined,
+// multi_form: MultiForm = undefined,
 parser: *dom.Parser = undefined,
+header_buf: [4096]u8 = undefined,
+header_buf_len: usize = 0,
 
 pub fn init(
-    arena: *mem.Allocator,
+    arena: mem.Allocator,
     method: []const u8,
     route: []const u8,
     client: ?*Client,
@@ -104,30 +91,30 @@ pub fn init(
     cookie_size: usize,
 ) !Self {
     const parser = try arena.create(dom.Parser);
-    parser.* = try dom.Parser.initFixedBuffer(arena.*, "", .{});
-    var form_params = std.StringHashMap([]const u8).init(arena.*);
+    parser.* = try dom.Parser.initFixedBuffer(arena, "", .{});
     const req_cookies = try arena.alloc(Cookie, cookie_size);
     const query_params = try arena.alloc(Param, 256);
     const params = try arena.alloc(Param, cookie_size);
+
+    const form_params = try arena.create(std.StringHashMap([]const u8));
+    form_params.* = std.StringHashMap([]const u8).init(arena);
+
+    const cookies = try arena.create(std.StringHashMap(Cookie));
+    cookies.* = std.StringHashMap(Cookie).init(arena);
+
     return Self{
         .arena = arena,
         .method = method,
         .route = route,
         .params = params,
         .query_params = query_params,
-        .form_params = &form_params,
-        // .headers = std.StringHashMap([]const u8).init(arena.*),
-        // .setValues = std.StringHashMap([]const u8).init(arena.*),
+        .form_params = form_params,
         .http_payload = "",
         .content_type = content_type,
         .client = client,
         .parser = parser,
-        // .ssl = ssl,
-        .cookies = std.StringHashMap(Cookie).init(arena.*),
+        .cookies = cookies,
         .req_cookies = req_cookies,
-        // .sticky_session = null,
-        // .boundary = boundary,
-        // .reply_builder = String.new(),
     };
 }
 
@@ -163,10 +150,21 @@ pub fn deinit(self: *Self) !void {
 }
 
 pub fn clear(self: *Self) void {
+    var itr = self.form_params.iterator();
+    while (itr.next()) |e| {
+        self.arena.free(e.value_ptr.*);
+    }
+    self.form_params.clearRetainingCapacity();
     self.cookies.clearRetainingCapacity();
     self.req_params_index = 0;
     self.req_query_params_index = 0;
     self.req_cookie_index = 0;
+    self.content_length = 0;
+    self.http_payload = "";
+    self.content_type = helpers.ContentType.None;
+    self.header_buf = undefined;
+    self.header_buf_len = 0;
+    self.http_header = .{};
     // self.query_params.clearRetainingCapacity();
     // self.params.clearRetainingCapacity();
 }
@@ -178,6 +176,14 @@ pub fn addParam(self: *Self, name: []const u8, value: []const u8) !void {
         .value = value,
     };
     self.req_params_index += 1;
+}
+
+pub fn parseParams(self: *Self) !void {
+    _ = try helpers.parseParams(self, self.http_header.path);
+}
+
+pub fn body(self: *Self) []const u8 {
+    return self.payload[0..self.content_length];
 }
 
 pub fn addQueryParam(self: *Self, name: []const u8, value: []const u8) !void {
@@ -211,7 +217,7 @@ fn generateCookieString(self: *Self) ![]const u8 {
     }
 
     // Create array_list.Managed with pre-allocated capacity
-    var buffer_cookie = try std.array_list.Managed(u8).initCapacity(self.arena.*, estimated_size);
+    var buffer_cookie = try std.array_list.Managed(u8).initCapacity(self.arena, estimated_size);
     defer buffer_cookie.deinit();
 
     // Reset iterator
@@ -254,86 +260,182 @@ fn generateCookieString(self: *Self) ![]const u8 {
         try buffer_cookie.appendSlice("\r\n");
     }
 
+    try buffer_cookie.appendSlice("\r\n");
     return buffer_cookie.toOwnedSlice();
 }
 
-// fn generateCookieString(self: *Self) ![]const u8 {
-//     var buffer_cookie = std.array_list.Managed(u8).init(self.arena.*);
-//     defer buffer_cookie.deinit();
-//
-//     var cookies_itr = self.cookies.iterator();
-//     // var builder: std.RingBuffer = try std.RingBuffer.init(self.arena, 4096);
-//     while (cookies_itr.next()) |entry| {
-//         const key = entry.key_ptr.*;
-//         const cookie = entry.value_ptr.*;
-//         _ = try buffer_cookie.writer().write("Set-Cookie: ");
-//         _ = try buffer_cookie.writer().write(key);
-//         _ = try buffer_cookie.writer().write("=");
-//         _ = try buffer_cookie.writer().write(cookie.value);
-//         _ = try buffer_cookie.writer().write("; ");
-//         if (cookie.secure) {
-//             _ = try buffer_cookie.writer().write("Secure;");
-//         }
-//         _ = try buffer_cookie.writer().write("Path=/;");
-//         if (cookie.expires) |expires| {
-//             try buffer_cookie.writer().print(
-//                 "Max-Age={d};",
-//                 .{expires},
-//             );
-//         }
-//
-//         if (cookie.http_only) {
-//             _ = try buffer_cookie.writer().write("HttpOnly");
-//         }
-//         if (cookies_itr.index <= self.cookies.count() - 1) {
-//             _ = try buffer_cookie.writer().write(";");
-//         }
-//         _ = try buffer_cookie.writer().write("\r\n");
-//     } else {
-//         _ = try buffer_cookie.writer().write("\r\n");
-//     }
-//
-//     const cookie_str = buffer_cookie.toOwnedSlice();
-//     return cookie_str;
-// }
-
-const error_resp =
-    "Vary: Origin\r\n" ++
-    "Connection: close\r\n" ++
-    "Content-Type: text/html; charset=utf8\r\n";
-
 const ctnt = "Content-Length: ";
+
+fn headerAppend(self: *Self, end: *usize, slice: []const u8) !void {
+    const next = end.* + slice.len;
+    if (next > self.header_buf.len) return error.HeaderBufferOverflow;
+    @memcpy(self.header_buf[end.*..next], slice);
+    end.* = next;
+}
+
+fn buildStandardHeaders(
+    self: *Self,
+    status_line: []const u8,
+    content_type: []const u8,
+    content_length: usize,
+    include_date: bool,
+    extra_header_name: ?[]const u8,
+    extra_header_value: ?[]const u8,
+) !usize {
+    var end: usize = 0;
+
+    try self.headerAppend(&end, status_line);
+    try self.headerAppend(&end, "Content-Type: ");
+    try self.headerAppend(&end, content_type);
+    try self.headerAppend(&end, "\r\n");
+
+    if (include_date) {
+        const date_str = httpDate();
+        try self.headerAppend(&end, "Date: ");
+        try self.headerAppend(&end, date_str);
+        try self.headerAppend(&end, "\r\n");
+    }
+
+    if (extra_header_name) |name| {
+        if (extra_header_value) |value| {
+            try self.headerAppend(&end, name);
+            try self.headerAppend(&end, ": ");
+            try self.headerAppend(&end, value);
+            try self.headerAppend(&end, "\r\n");
+        }
+    }
+
+    if (cors_headers) |ch| {
+        try self.headerAppend(&end, ch);
+    }
+
+    if (self.http_header.accept_control_request_headers.len > 0) {
+        try self.headerAppend(&end, "Access-Control-Allow-Headers: ");
+        try self.headerAppend(&end, self.http_header.accept_control_request_headers);
+        try self.headerAppend(&end, "\r\n");
+    }
+
+    try self.headerAppend(&end, ctnt);
+    var len_buf: [20]u8 = undefined;
+    const len_str = try std.fmt.bufPrint(&len_buf, "{}", .{content_length});
+    try self.headerAppend(&end, len_str);
+    try self.headerAppend(&end, "\r\n");
+
+    const cookie_str = try self.generateCookieString();
+    try self.headerAppend(&end, cookie_str);
+
+    self.header_buf_len = end;
+    return end;
+}
+
 pub fn ERROR(self: *Self, status_code: u16, payload: []const u8) !void {
-    // const proto_str = "HTTP/1.1 {d} NOT FOUND";
-    const proto_str = "HTTP/1.1 ";
-    const max_len = 4;
-    var end: usize = proto_str.len;
+    var status_line_buf: [128]u8 = undefined;
+    const status_line = try std.fmt.bufPrint(
+        &status_line_buf,
+        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\nConnection: close\r\n",
+        .{ status_code, statusReason(status_code) },
+    );
+
+    var end = try self.buildStandardHeaders(
+        status_line,
+        "text/html; charset=utf8",
+        payload.len,
+        true,
+        null,
+        null,
+    );
+
+    if (end + payload.len <= self.header_buf.len) {
+        const start = end;
+        end += payload.len;
+        @memcpy(self.header_buf[start..end], payload);
+        try self.client.?.write(self.header_buf[0..end]);
+        return;
+    }
+
+    try self.client.?.write(self.header_buf[0..end]);
+    try stream(self.client.?, payload);
+}
+
+pub fn STATUS(self: *Self, status_code: u16, payload: []const u8) !void {
+    var status_line_buf: [128]u8 = undefined;
+    const status_line = try std.fmt.bufPrint(
+        &status_line_buf,
+        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\n",
+        .{ status_code, statusReason(status_code) },
+    );
+
+    const content_type = self.http_header.content_type.toString();
+    var end = try self.buildStandardHeaders(
+        status_line,
+        content_type,
+        payload.len,
+        true,
+        null,
+        null,
+    );
+
+    if (end + payload.len <= self.header_buf.len) {
+        const start = end;
+        end += payload.len;
+        @memcpy(self.header_buf[start..end], payload);
+        try self.client.?.write(self.header_buf[0..end]);
+        return;
+    }
+
+    try self.client.?.write(self.header_buf[0..end]);
+    try stream(self.client.?, payload);
+}
+
+fn statusReason(code: u16) []const u8 {
+    return switch (code) {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        else => "Unknown",
+    };
+}
+
+// Look into redirecting users
+pub fn REDIRECT(self: *Self, location: []const u8) !void {
+    const cookie_str = try self.generateCookieString();
+
+    const redirect_resp =
+        "HTTP/1.1 302 Found\r\n" ++
+        "Vary: Origin\r\n";
+
+    var end: usize = redirect_resp.len;
     var start: usize = 0;
 
-    // 0, 9
-    @memcpy(buffer[start..end], proto_str);
-    start += proto_str.len;
+    // Status line
+    @memcpy(buffer[start..end], redirect_resp);
+    start = redirect_resp.len;
 
-    var error_code: [max_len]u8 = undefined;
-    const error_code_str = try std.fmt.bufPrint(&error_code, "{}", .{status_code});
-    end += error_code_str.len;
+    // Location header
+    const location_header = "Location: ";
+    end += location_header.len;
+    @memcpy(buffer[start..end], location_header);
+    start += location_header.len;
 
-    // 9, 13
-    @memcpy(buffer[start..end], error_code_str);
-    start += error_code_str.len;
+    end += location.len;
+    @memcpy(buffer[start..end], location);
+    start += location.len;
 
-    const not_found = " NOT FOUND\r\n";
-    end += not_found.len;
-    // 13, 25
-    @memcpy(buffer[start..end], not_found);
-    start += not_found.len;
+    end += 2;
+    @memcpy(buffer[start..end], "\r\n");
+    start += 2;
 
-    // Error Response
-    end += error_resp.len;
-    @memcpy(buffer[start..end], error_resp);
-    start += error_resp.len;
-
-    // Cors
+    // CORS headers
     if (cors_headers) |ch| {
         end += ch.len;
         @memcpy(buffer[start..end], ch);
@@ -355,51 +457,20 @@ pub fn ERROR(self: *Self, status_code: u16, payload: []const u8) !void {
         start += 2;
     }
 
-    end += ctnt.len;
-    @memcpy(buffer[start..end], ctnt);
-    start += ctnt.len;
+    // Content-Length: 0
+    const content_len = "Content-Length: 0\r\n";
+    end += content_len.len;
+    @memcpy(buffer[start..end], content_len);
+    start += content_len.len;
 
-    var buf: [max_len]u8 = undefined;
-    const numAsString = try std.fmt.bufPrint(&buf, "{}", .{payload.len});
-    end += numAsString.len;
-    @memcpy(buffer[start..end], numAsString);
-    start += numAsString.len;
+    // Cookies
+    end += cookie_str.len;
+    @memcpy(buffer[start..end], cookie_str);
+    start += cookie_str.len;
+    std.debug.print("total: {s}\n", .{buffer[0..end]});
 
-    end += crlf.len;
-    @memcpy(buffer[start..end], crlf);
-    start += crlf.len;
-    end += payload.len;
-    @memcpy(buffer[start..end], payload);
-    _ = try posix.write(self.client.?.socket, buffer[0..end]);
+    try stream(self.client.?, buffer[0..end]);
 }
-
-// Look into redirecting users
-pub fn REDIRECT(self: *Self, payload: []const u8) !void {
-    var builder = try self.generateCookieString();
-    defer builder.deinit(self.arena);
-    const stt = "HTTP/1.1 302 Found \r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "Access-Control-Allow-Credentials: true\r\n" ++
-        "Access-Control-Max-Age: 86400\r\n" ++
-        "Vary: Origin\r\n" ++
-        "Location: {s} \r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n";
-    const response = std.fmt.allocPrint(
-        self.arena,
-        stt,
-        .{payload},
-    ) catch unreachable;
-    if (self.ssl != null) {
-        tlsWrite(self.ssl.?, response);
-    } else {
-        try httpWrite(self.client.?, response);
-    }
-    self.arena.free(response);
-}
-
 pub const String = struct {
     start: usize,
     len: usize,
@@ -450,175 +521,199 @@ pub const String = struct {
 // When testing with wrk remove connection close
 const string_success_resp =
     "HTTP/1.1 200 OK\r\n" ++
-    "Vary: Origin\r\n" ++
-    // "Date: Fri, 31 Oct 2025 15:59:12 GMT\r\n" ++
-    "Content-Type: text/plain charset=utf-8\r\n";
+    "Vary: Origin\r\n";
+// "Date: Fri, 31 Oct 2025 15:59:12 GMT\r\n" ++
+// "Content-Type: text/plain charset=utf-8\r\n";
 // "Connection: close\r\n" ++
 // "Content-Type: text/html\r\n";
 
 // const resp = "HTTP/1.1 200 OK\r\nDate: Tue, 19 Aug 2025 18:37:36 GMT\r\nContent-Length: 7\r\nContent-Type: text/plain charset=utf-8\r\n\r\nSUCCESS";
 
-var buffer: [5_000_000]u8 = undefined;
-pub fn STRING(self: *Self, payload: []const u8) !void {
-    var end: usize = string_success_resp.len;
-    var start: usize = 0;
+const weekday_names = [_]*const [3]u8{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+const month_names = [_]*const [3]u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
-    // Success Response
-    @memcpy(buffer[start..end], string_success_resp);
-    start = string_success_resp.len;
+var cached_date: [29]u8 = undefined;
+var cached_day_secs_base: u64 = 0; // timestamp of start of cached day
+var cached_initialized: bool = false;
 
-    // Cors
-    if (cors_headers) |ch| {
-        end += ch.len;
-        @memcpy(buffer[start..end], ch);
-        start += ch.len;
-    }
+/// Positions of time digits within the 29-byte HTTP date string:
+/// "Thu, 09 Apr 2026 HH:MM:SS GMT"
+///  0123456789012345678901234567890
+///                   ^^ ^^ ^^
+/// hour=17,18  min=20,21  sec=23,24
+const hour_pos = 17;
+const min_pos = 20;
+const sec_pos = 23;
 
-    if (self.http_header.accept_control_request_headers.len > 0) {
-        const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
-        end += access_ctrl_req_headers.len;
-        @memcpy(buffer[start..end], access_ctrl_req_headers);
-        start += access_ctrl_req_headers.len;
+const digits = "0123456789";
 
-        end += self.http_header.accept_control_request_headers.len;
-        @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
-        start += self.http_header.accept_control_request_headers.len;
+/// Call once at startup and then whenever the day rolls over.
+/// Rebuilds the full date string for the current day.
+fn rebuildDateBase(timestamp: u64) void {
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = timestamp };
+    const epoch_day = epoch_secs.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
 
-        end += 2;
-        @memcpy(buffer[start..end], "\r\n");
-        start += 2;
-    }
+    const year = year_day.year;
+    const month = @intFromEnum(month_day.month); // 0-indexed
+    const day: u8 = month_day.day_index + 1;
 
-    end += ctnt.len;
-    @memcpy(buffer[start..end], ctnt);
-    start += ctnt.len;
+    // Day of week: Jan 1 1970 was Thursday (index 3 in Mon=0 scheme)
+    // epoch_day.day is days since epoch
+    const raw_day: u64 = epoch_day.day;
+    const wday: u3 = @intCast((raw_day + 3) % 7); // Mon=0 .. Sun=6
 
-    const max_len = 4;
-    var buf: [max_len]u8 = undefined;
-    const numAsString = try std.fmt.bufPrint(&buf, "{}", .{payload.len});
-    end += numAsString.len;
-    @memcpy(buffer[start..end], numAsString);
-    start += numAsString.len;
+    // "Thu, 09 Apr 2026 00:00:00 GMT"
+    const wdn = weekday_names[wday];
+    const mn = month_names[month];
 
-    end += 2;
-    @memcpy(buffer[start..end], "\r\n");
-    start += 2;
+    cached_date[0] = wdn[0];
+    cached_date[1] = wdn[1];
+    cached_date[2] = wdn[2];
+    cached_date[3] = ',';
+    cached_date[4] = ' ';
+    cached_date[5] = digits[day / 10];
+    cached_date[6] = digits[day % 10];
+    cached_date[7] = ' ';
+    cached_date[8] = mn[0];
+    cached_date[9] = mn[1];
+    cached_date[10] = mn[2];
+    cached_date[11] = ' ';
 
-    const cookie_str = try self.generateCookieString();
+    const y: u64 = @intCast(year);
+    cached_date[12] = digits[y / 1000];
+    cached_date[13] = digits[(y / 100) % 10];
+    cached_date[14] = digits[(y / 10) % 10];
+    cached_date[15] = digits[y % 10];
+    cached_date[16] = ' ';
 
-    end += cookie_str.len;
-    @memcpy(buffer[start..end], cookie_str);
-    start += cookie_str.len;
+    // Placeholder time
+    cached_date[17] = '0';
+    cached_date[18] = '0';
+    cached_date[19] = ':';
+    cached_date[20] = '0';
+    cached_date[21] = '0';
+    cached_date[22] = ':';
+    cached_date[23] = '0';
+    cached_date[24] = '0';
+    cached_date[25] = ' ';
+    cached_date[26] = 'G';
+    cached_date[27] = 'M';
+    cached_date[28] = 'T';
 
-    // end += crlf.len;
-    // @memcpy(buffer[start..end], crlf);
-    // start += crlf.len;
-
-    // end += 2;
-    // @memcpy(buffer[start..end], "\r\n");
-    // start += 2;
-
-    end += payload.len;
-    @memcpy(buffer[start..end], payload);
-    try stream(self.client.?, buffer[0..end]);
-    // _ = try posix.write(self.client.?.socket, buffer[0..end]);
+    // Cache the start-of-day timestamp so we can check rollover cheaply
+    const day_seconds = epoch_secs.getDaySeconds();
+    cached_day_secs_base = timestamp - day_seconds.secs;
 }
 
-pub fn FILE(self: *Self, file: std.fs.File) !void {
-    const stat = try file.stat();
+/// Returns a pointer to the 29-byte cached HTTP date string.
+/// Only updates the 6 time digits on each call; rebuilds the
+/// date portion only when the day rolls over.
+pub fn httpDate() *const [29]u8 {
+    const timestamp: u64 = @intCast(Time.timestamp());
+
+    // Rebuild if not initialized, if the clock moved backwards, or if the day rolled over.
+    if (!cached_initialized or timestamp < cached_day_secs_base or timestamp >= cached_day_secs_base + 86400) {
+        rebuildDateBase(timestamp);
+        cached_initialized = true;
+    }
+
+    // Stamp in the current time (6 digit writes)
+    const secs_into_day: u64 = timestamp - cached_day_secs_base;
+    const hour: u8 = @intCast(secs_into_day / 3600);
+    const minute: u8 = @intCast((secs_into_day % 3600) / 60);
+    const second: u8 = @intCast(secs_into_day % 60);
+
+    cached_date[hour_pos] = digits[hour / 10];
+    cached_date[hour_pos + 1] = digits[hour % 10];
+    cached_date[min_pos] = digits[minute / 10];
+    cached_date[min_pos + 1] = digits[minute % 10];
+    cached_date[sec_pos] = digits[second / 10];
+    cached_date[sec_pos + 1] = digits[second % 10];
+
+    return &cached_date;
+}
+
+var buffer: [5_000_000]u8 = undefined;
+pub fn STRING(self: *Self, payload: []const u8) !void {
+    const content_type = self.http_header.content_type.toString();
+    var end = try self.buildStandardHeaders(
+        string_success_resp,
+        content_type,
+        payload.len,
+        true,
+        null,
+        null,
+    );
+
+    // Fast path: coalesce headers + payload if they both fit in header_buf.
+    if (end + payload.len <= self.header_buf.len) {
+        const start = end;
+        end += payload.len;
+        @memcpy(self.header_buf[start..end], payload);
+        self.client.?.write(self.header_buf[0..end]) catch |err| {
+            std.log.err("Failed to write coalesced STRING response: {any}", .{err});
+            return error.StringStreamError;
+        };
+        return;
+    }
+
+    // Large payload path: write headers first, then stream body bytes.
+    self.client.?.write(self.header_buf[0..end]) catch |err| {
+        std.log.err("Failed to write STRING headers: {any}", .{err});
+        return error.StringStreamError;
+    };
+
+    stream(self.client.?, payload) catch |err| {
+        std.log.err("Failed to stream STRING payload: {any}", .{err});
+        return error.StringStreamError;
+    };
+}
+
+pub fn OPTIONS(self: *Self) !void {
+    const status_line =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Vary: Accept-Encoding, Origin\r\n" ++
+        "Connection: Keep-Alive\r\n";
+
+    const end = try self.buildStandardHeaders(
+        status_line,
+        "text/html; charset=utf8",
+        0,
+        true,
+        null,
+        null,
+    );
+
+    try self.client.?.write(self.header_buf[0..end]);
+}
+
+pub fn FILE(self: *Self, file: std.Io.File) !void {
+    const stat = try file.stat(self.client.?.io);
     const file_success_resp =
         "HTTP/1.1 200 OK\r\n" ++
         "Vary: Origin\r\n";
+    const mime_raw = mimeForPath(self.route);
+    const mime = std.mem.trimEnd(u8, mime_raw, "\r\n");
+    const content_encoding = self.http_header.content_encoding;
 
-    var end: usize = file_success_resp.len;
-    var start: usize = 0;
+    const end = try self.buildStandardHeaders(
+        file_success_resp,
+        mime,
+        @intCast(stat.size),
+        true,
+        if (content_encoding.len > 0) "Content-Encoding" else null,
+        if (content_encoding.len > 0) content_encoding else null,
+    );
 
-    // Success Response
-    @memcpy(buffer[start..end], file_success_resp);
-    start = file_success_resp.len;
-
-    const ctnt_type = "Content-Type: ";
-    end += ctnt_type.len;
-    @memcpy(buffer[start..end], ctnt_type);
-    start += ctnt_type.len;
-
-    const mime = mimeForPath(self.route);
-    end += mime.len;
-    @memcpy(buffer[start..end], mime);
-    start += mime.len;
-
-    // Cors
-    if (cors_headers) |ch| {
-        end += ch.len;
-        @memcpy(buffer[start..end], ch);
-        start += ch.len;
-    }
-
-    if (self.http_header.accept_control_request_headers.len > 0) {
-        const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
-        end += access_ctrl_req_headers.len;
-        @memcpy(buffer[start..end], access_ctrl_req_headers);
-        start += access_ctrl_req_headers.len;
-
-        end += self.http_header.accept_control_request_headers.len;
-        @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
-        start += self.http_header.accept_control_request_headers.len;
-
-        end += 2;
-        @memcpy(buffer[start..end], "\r\n");
-        start += 2;
-    }
-
-    end += ctnt.len;
-    @memcpy(buffer[start..end], ctnt);
-    start += ctnt.len;
-
-    // if (std.mem.indexOf(u8, self.http_header.path, ".wasm")) |_| {
-    //     std.debug.print("{s}\n", .{buffer[0..end]});
-    //     if (self.http_header.accept_encoding.len > 0) {
-    //         std.debug.print("Accept Encoding: {s}\n", .{self.http_header.accept_encoding});
-    //         const access_ctrl_req_headers = "Content-Encoding: ";
-    //         end += access_ctrl_req_headers.len;
-    //         @memcpy(buffer[start..end], access_ctrl_req_headers);
-    //         start += access_ctrl_req_headers.len;
-    //
-    //         end += 2;
-    //         @memcpy(buffer[start..end], "br");
-    //         std.debug.print("-----: {s}\n", .{buffer[start - access_ctrl_req_headers.len .. end]});
-    //         start += 2;
-    //
-    //         end += 2;
-    //         @memcpy(buffer[start..end], "\r\n");
-    //         start += 2;
-    //     }
-    // }
-
-    const max_len = 32;
-    var buf: [max_len]u8 = undefined;
-    const numAsString = try std.fmt.bufPrint(&buf, "{}", .{stat.size});
-    end += numAsString.len;
-    @memcpy(buffer[start..end], numAsString);
-    start += numAsString.len;
-
-    end += 2;
-    @memcpy(buffer[start..end], "\r\n");
-    start += 2;
-
-    const cookie_str = try self.generateCookieString();
-
-    end += cookie_str.len;
-    @memcpy(buffer[start..end], cookie_str);
-    start += cookie_str.len;
-
-    const client = self.client.?;
-    try client.write(buffer[0..end]);
-
-    end += stat.size;
-    try client.sendFile(file);
+    try self.client.?.write(self.header_buf[0..end]);
+    try self.client.?.sendFile(file);
 }
 
 fn stream(client: *Client, payload: []const u8) !void {
     client.chunked(payload) catch |err| {
+        std.log.err("Failed to chunk {any}", .{err});
         return err;
     };
 }
@@ -1533,66 +1628,35 @@ pub fn ARRAY(self: *Self, comptime T: type, data: T) !void {
 pub fn JSON(self: *Self, comptime T: type, data: T) !void {
     const fmt = std.json.fmt(data, .{ .whitespace = .indent_2 });
 
-    var writer = std.Io.Writer.Allocating.init(self.arena.*);
+    var writer = std.Io.Writer.Allocating.init(self.arena);
     try fmt.format(&writer.writer);
 
     const payload = try writer.toOwnedSlice();
+    var end = try self.buildStandardHeaders(
+        string_success_resp,
+        helpers.ContentType.JSON.toString(),
+        payload.len,
+        true,
+        null,
+        null,
+    );
 
-    // const payload = writer.contents[0..writer.len];
-
-    var end: usize = success_resp.len;
-    var start: usize = 0;
-
-    // Success Response
-    @memcpy(buffer[start..end], success_resp);
-    start = success_resp.len;
-
-    // Cors
-    if (cors_headers) |ch| {
-        end += ch.len;
-        @memcpy(buffer[start..end], ch);
-        start += ch.len;
+    if (end + payload.len <= self.header_buf.len) {
+        const start = end;
+        end += payload.len;
+        @memcpy(self.header_buf[start..end], payload);
+        try self.client.?.write(self.header_buf[0..end]);
+        return;
     }
 
-    if (self.http_header.accept_control_request_headers.len > 0) {
-        const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
-        end += access_ctrl_req_headers.len;
-        @memcpy(buffer[start..end], access_ctrl_req_headers);
-        start += access_ctrl_req_headers.len;
-
-        end += self.http_header.accept_control_request_headers.len;
-        @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
-        start += self.http_header.accept_control_request_headers.len;
-
-        end += 2;
-        @memcpy(buffer[start..end], "\r\n");
-        start += 2;
-    }
-
-    end += ctnt.len;
-    @memcpy(buffer[start..end], ctnt);
-    start += ctnt.len;
-
-    const max_len = 20;
-    var buf: [max_len]u8 = undefined;
-    const numAsString = try std.fmt.bufPrint(&buf, "{}", .{payload.len});
-    end += numAsString.len;
-    @memcpy(buffer[start..end], numAsString);
-    start += numAsString.len;
-
-    end += crlf.len;
-    @memcpy(buffer[start..end], crlf);
-    start += crlf.len;
-    end += payload.len;
-    @memcpy(buffer[start..end], payload);
-    _ = try posix.write(self.client.?.socket, buffer[0..end]);
+    try self.client.?.write(self.header_buf[0..end]);
+    try stream(self.client.?, payload);
 }
 
 // When testing with wrk remove connection close
 const html_success_resp =
     "HTTP/1.1 200 OK\r\n" ++
-    "Vary: Origin\r\n" ++
-    "Content-Type: text/html; charset=utf8\r\n";
+    "Vary: Origin\r\n";
 
 const mimeTypes = .{
     .{ ".html", "text/html; charset=utf8\r\n" },
@@ -1620,59 +1684,25 @@ pub fn mimeForPath(path: []const u8) []const u8 {
 }
 
 pub fn HTML(self: *Self, payload: []const u8) !void {
-    var end: usize = html_success_resp.len;
-    var start: usize = 0;
+    var end = try self.buildStandardHeaders(
+        html_success_resp,
+        "text/html; charset=utf8",
+        payload.len,
+        true,
+        null,
+        null,
+    );
 
-    // Success Response
-    @memcpy(buffer[start..end], html_success_resp);
-    start = html_success_resp.len;
-
-    // Cors
-    if (cors_headers) |ch| {
-        end += ch.len;
-        @memcpy(buffer[start..end], ch);
-        start += ch.len;
+    if (end + payload.len <= self.header_buf.len) {
+        const start = end;
+        end += payload.len;
+        @memcpy(self.header_buf[start..end], payload);
+        try self.client.?.write(self.header_buf[0..end]);
+        return;
     }
 
-    if (self.http_header.accept_control_request_headers.len > 0) {
-        const access_ctrl_req_headers = "Access-Control-Allow-Headers: ";
-        end += access_ctrl_req_headers.len;
-        @memcpy(buffer[start..end], access_ctrl_req_headers);
-        start += access_ctrl_req_headers.len;
-
-        end += self.http_header.accept_control_request_headers.len;
-        @memcpy(buffer[start..end], self.http_header.accept_control_request_headers);
-        start += self.http_header.accept_control_request_headers.len;
-
-        end += 2;
-        @memcpy(buffer[start..end], "\r\n");
-        start += 2;
-    }
-
-    end += ctnt.len;
-    @memcpy(buffer[start..end], ctnt);
-    start += ctnt.len;
-
-    const max_len = 4;
-    var buf: [max_len]u8 = undefined;
-    const numAsString = try std.fmt.bufPrint(&buf, "{}", .{payload.len});
-    end += numAsString.len;
-    @memcpy(buffer[start..end], numAsString);
-    start += numAsString.len;
-
-    end += 2;
-    @memcpy(buffer[start..end], "\r\n");
-    start += 2;
-
-    const cookie_str = try self.generateCookieString();
-
-    end += cookie_str.len;
-    @memcpy(buffer[start..end], cookie_str);
-    start += cookie_str.len;
-
-    end += payload.len;
-    @memcpy(buffer[start..end], payload);
-    _ = try posix.write(self.client.?.socket, buffer[0..end]);
+    try self.client.?.write(self.header_buf[0..end]);
+    try stream(self.client.?, payload);
 }
 
 pub fn SET(self: *Self, key: []const u8, comptime T: type, data: T) !void {
@@ -1706,8 +1736,15 @@ pub fn getCookie(self: *Self, cookie_name: []const u8) ?Cookie {
     return null;
 }
 
+/// Looks up a query-string parameter by name.
+///
+/// Only the entries written for this request are scanned: the backing
+/// slice is allocated once and reused, so everything past
+/// `req_query_params_index` is left over from an earlier request or never
+/// initialised at all, and comparing against it would read garbage
+/// pointers.
 pub fn queryParam(self: *Self, name: []const u8) ?Param {
-    for (self.query_params) |param_elem| {
+    for (self.query_params[0..self.req_query_params_index]) |param_elem| {
         if (std.mem.eql(u8, param_elem.name, name)) {
             return param_elem;
         }
@@ -1716,8 +1753,12 @@ pub fn queryParam(self: *Self, name: []const u8) ?Param {
     return null;
 }
 
-pub fn param(self: *Self, name: []const u8) ![]const u8 {
-    for (self.params) |param_elem| {
+/// Looks up a path parameter by name — the `:id` in `/users/:id`.
+///
+/// Bounded to the entries written for this request, for the same reason as
+/// `queryParam`.
+pub fn param(self: *Self, name: []const u8) ?Param {
+    for (self.params[0..self.req_params_index]) |param_elem| {
         if (std.mem.eql(u8, param_elem.name, name)) {
             return param_elem;
         }
@@ -1770,7 +1811,7 @@ fn decoder(encoded: []const u8, decoded: *std.array_list.Managed(u8)) !void {
 }
 
 pub fn parseForm(self: *Self) !void {
-    if (self.content_type != helpers.ContentType.Form) return CtxError.MalformedFormContentType;
+    if (self.http_header.content_type != helpers.ContentType.Form) return CtxError.MalformedFormContentType;
 
     // "username=johndoe&password=secret123&remember=true&redirect=%2Fdashboard";
     const payload = self.payload[0..self.content_length];
@@ -1782,15 +1823,15 @@ pub fn parseForm(self: *Self) !void {
             pos += ki + 1;
             if (findIndex(payload[pos..], '&')) |vi| {
                 const form_value = payload[pos .. vi + pos];
-                pos += vi;
-                var decoded = std.array_list.Managed(u8).init(self.arena.*);
+                pos += vi + 1;
+                var decoded = std.array_list.Managed(u8).init(self.arena);
                 try decoder(form_value, &decoded);
                 const resp = try decoded.toOwnedSlice();
                 try self.addFormParam(form_key, resp);
             } else {
                 const form_value = payload[pos..];
                 pos = sentinal;
-                var decoded = std.array_list.Managed(u8).init(self.arena.*);
+                var decoded = std.array_list.Managed(u8).init(self.arena);
                 try decoder(form_value, &decoded);
                 const resp = try decoded.toOwnedSlice();
                 try self.addFormParam(form_key, resp);
@@ -1808,7 +1849,7 @@ pub fn parseMulti(self: *Self) !void {
     // while (pos < sentinal) {
     // }
     var multi_form: MultiForm = MultiForm{
-        .form_data = std.array_list.Managed(Data).init(self.arena.*),
+        .form_data = std.array_list.Managed(Data).init(self.arena),
     };
     var boundary_itr = mem.tokenizeSequence(u8, payload, boundary);
     _ = boundary_itr.next();
@@ -1848,7 +1889,8 @@ pub fn parseMulti(self: *Self) !void {
         }
         try multi_form.form_data.append(data);
     }
-    self.multi_form = multi_form;
+    return multi_form;
+    // self.multi_form = multi_form;
 }
 
 // TODO figure what the hell is wrong with struct fields set to []const u8,
@@ -1875,39 +1917,39 @@ pub fn bind(self: *Self, comptime T: type, value: *T) !void {
         T,
         self.arena,
         self.payload[0..self.content_length],
-        .{},
+        .{ .ignore_unknown_fields = true },
     ) catch return error.MalformedJson;
 
     // we need to parse the struct []const u8 into []u8 to store in the hashmap
     inline for (fields) |f| {
         if (f.type == []const u8) {
             const field_value = @field(parsed.value, f.name);
-            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, std.heap.c_allocator);
+            // `self.arena`, matching `glue` below. This used to be
+            // `std.heap.c_allocator`, which forced a libc dependency and
+            // allocated outside the request's arena, so it was never freed.
+            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.arena);
         }
     }
     value.* = parsed.value;
 }
 
-pub fn glue(self: *Self, comptime T: type, value: *T) !void {
-    // assert_cm(@intFromEnum(self.content_type) == @intFromEnum(helpers.ContentType.JSON), "Http Payload must be JSON to Bind");
+pub fn glue(self: *Self, comptime T: type) !T {
     const fields = @typeInfo(T).@"struct".fields;
-    var parsed = std.json.parseFromSlice(
+    var parsed = try std.json.parseFromSlice(
         T,
-        self.arena.*,
+        self.arena,
         self.payload[0..self.content_length],
-        .{},
-    ) catch |err| {
-        return err;
-    };
+        .{ .ignore_unknown_fields = true },
+    );
 
     // we need to parse the struct []const u8 into []u8 to store in the hashmap
     inline for (fields) |f| {
         if (f.type == []const u8) {
             const field_value = @field(parsed.value, f.name);
-            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, std.heap.c_allocator);
+            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.arena);
         }
     }
-    value.* = parsed.value;
+    return parsed.value;
 }
 
 pub fn gluev2(self: *Self, comptime T: type, data: *T) !void {
@@ -1919,7 +1961,7 @@ pub fn gluev2(self: *Self, comptime T: type, data: *T) !void {
         print("Failed to parse parser\n", .{});
         return err;
     };
-    self.parser.element().get_alloc(self.arena.*, data) catch |err| {
+    self.parser.element().get_alloc(self.arena, data) catch |err| {
         print("Failed to alloc\n", .{});
         return err;
     };

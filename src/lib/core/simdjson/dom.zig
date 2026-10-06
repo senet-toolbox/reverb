@@ -17,8 +17,8 @@ const string_parsing = @import("string_parsing.zig");
 const v = @import("vector_types.zig");
 
 pub const Document = struct {
-    tape: std.ArrayListUnmanaged(u64) = .{},
-    string_buf: std.ArrayListUnmanaged(u8) = .{},
+    tape: std.ArrayListUnmanaged(u64) = .empty,
+    string_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn allocate(document: *Document, allocator: mem.Allocator, capacity: u32) !void {
         if (capacity == 0) return;
@@ -46,7 +46,7 @@ pub const Document = struct {
 };
 
 const BitIndexer = struct {
-    tail: std.ArrayListUnmanaged(u32) = .{},
+    tail: std.ArrayListUnmanaged(u32) = .empty,
 
     // flatten out values in 'bits' assuming that they are are to have values of idx
     // plus their position in the bitvector, and store these indexes at
@@ -1284,7 +1284,7 @@ pub const Parser = struct {
     open_containers: std.MultiArrayList(OpenContainerInfo),
     max_depth: u16,
     n_structural_indexes: u32 = 0,
-    bytes: std.ArrayListUnmanaged(u8) = .{},
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
     input_len: u32 = 0,
 
     pub const Options = struct {
@@ -1314,7 +1314,6 @@ pub const Parser = struct {
             .allocator = allocator,
             .doc = .{},
             .indexer = .{},
-            .bytes = .{},
             .open_containers = .{},
             .max_depth = options.max_depth,
         };

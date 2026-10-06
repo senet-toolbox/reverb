@@ -7,15 +7,32 @@ const Context = @import("context.zig");
 pub const Metrics = @This();
 tether: *Tether,
 
+/// The registered route paths, grouped by method, for the
+/// `/metrics/allroutes` endpoint.
+///
+/// One of these belongs to each server instance rather than the process:
+/// the lists are allocated from that server's arena, so a global would
+/// outlive the memory backing it and a second server would reallocate a
+/// slice owned by the first one's freed arena.
 pub const EndPoints = struct {
-    POST: ?[][]const u8 = &[_][]const u8{},
-    GET: ?[][]const u8 = &[_][]const u8{},
-    PATCH: ?[][]const u8 = &[_][]const u8{},
-    DELETE: ?[][]const u8 = &[_][]const u8{},
-    UPDATE: ?[][]const u8 = &[_][]const u8{},
+    GET: ?[][]const u8 = null,
+    POST: ?[][]const u8 = null,
+    PATCH: ?[][]const u8 = null,
+    DELETE: ?[][]const u8 = null,
+    UPDATE: ?[][]const u8 = null,
+    HEAD: ?[][]const u8 = null,
+    OPTIONS: ?[][]const u8 = null,
+    CONNECT: ?[][]const u8 = null,
+    TRACE: ?[][]const u8 = null,
 };
 
-pub var end_points = EndPoints{};
+/// The endpoint lists `getAllRoutes` reports on.
+///
+/// `getAllRoutes` is an ordinary handler and so only receives a `*Context`,
+/// with no route back to its server — hence this pointer, which `Server.new`
+/// sets and `Server.deinit` clears. A process running two servers at once
+/// reports whichever registered last; it no longer reads freed memory.
+pub var active_end_points: ?*EndPoints = null;
 
 const Methods = enum {
     GET,
@@ -41,8 +58,8 @@ pub fn init(target: *Metrics, tether: *Tether) void {
 
 fn allocateRoute(
     node: Radix.Node,
-    buffer: *std.ArrayList(u8),
-    all_routes: *std.ArrayList([]const u8),
+    buffer: *std.array_list.Managed(u8),
+    all_routes: *std.array_list.Managed([]const u8),
     allocator: *std.mem.Allocator,
 ) !void {
     // Save current buffer length to backtrack later
@@ -80,12 +97,12 @@ fn allocateRoute(
 }
 
 // This maps all teh routes the system hhas
-pub fn mapRoutes(metrics: *Metrics) !void {
+pub fn mapRoutes(metrics: *Metrics, end_points: *EndPoints) !void {
     const radix_itr = metrics.tether.routes;
     for (radix_itr, 0..) |route, idx| {
-        var all_routes = std.ArrayList([]const u8).init(metrics.tether.arena.*);
+        var all_routes = std.array_list.Managed([]const u8).init(metrics.tether.arena.*);
         const node = route.root.*;
-        var buffer = std.ArrayList(u8).init(metrics.tether.arena.*);
+        var buffer = std.array_list.Managed(u8).init(metrics.tether.arena.*);
         try allocateRoute(node, &buffer, &all_routes, metrics.tether.arena);
         const method_str = methods[idx];
         const method = std.meta.stringToEnum(Methods, method_str) orelse return error.Null;
@@ -100,7 +117,8 @@ pub fn mapRoutes(metrics: *Metrics) !void {
 }
 
 pub fn getAllRoutes(ctx: *Context) !void {
-    try ctx.JSON(EndPoints, end_points);
+    const end_points = active_end_points orelse return ctx.ERROR(503, "metrics unavailable");
+    try ctx.JSON(EndPoints, end_points.*);
 }
 
 pub fn healthCheck(ctx: *Context) !void {

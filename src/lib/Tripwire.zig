@@ -18,7 +18,7 @@ const ErrorType = enum {
     JsonResponse,
 };
 
-const BreadCrumb = struct { event: Event };
+const BreadCrumb = struct { event: Event = .HTTP };
 pub const Error = struct {
     timestamp: i64 = 0,
     error_name: []const u8 = "",
@@ -49,8 +49,42 @@ const BreadCrumbNode = struct {
 };
 
 const Tripwire = @This();
-var errors_count: usize = 0;
-var recorded_error: bool = false;
+
+/// Upper bound on errors buffered between flushes. `recordError` drops
+/// anything beyond this rather than running off the end of the buffer.
+pub const max_buffered_errors: usize = 1024;
+
+/// Upper bound on retained breadcrumbs, so a long-lived process cannot
+/// grow the list without limit.
+pub const max_breadcrumbs: usize = 256;
+
+/// A minimal spinlock.
+///
+/// `std.Io.Mutex` needs an `Io` instance that Tripwire has no access to,
+/// and the critical sections here are a handful of instructions contended
+/// only by a flush that runs once every five seconds — so spinning costs
+/// less than plumbing an `Io` through would.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(l: *SpinLock) void {
+        while (l.locked.swap(true, .acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(l: *SpinLock) void {
+        l.locked.store(false, .release);
+    }
+};
+
+// `recordError` runs on request threads while the flush loop runs on its
+// own thread, so everything they share sits behind this lock.
+mutex: SpinLock = .{},
+errors_count: usize = 0,
+recorded_error: bool = false,
+dropped_errors: usize = 0,
+breadcrumb_count: usize = 0,
 breadcrumbs: BreadCrumbList = .{},
 errors: []Error = undefined,
 payloads: []Treehouse.ValueType,
@@ -59,9 +93,9 @@ allocator: *std.mem.Allocator = undefined,
 thread: std.Thread = undefined,
 
 pub fn init(tw: *Tripwire, allocator: *std.mem.Allocator) void {
-    const errors = allocator.alloc(Error, 1024) catch return;
+    const errors = allocator.alloc(Error, max_buffered_errors) catch return;
 
-    const payloads = allocator.alloc(Treehouse.ValueType, 1024) catch |err| {
+    const payloads = allocator.alloc(Treehouse.ValueType, max_buffered_errors) catch |err| {
         std.log.err("Could not alloc payloads Details: {any}\n", .{err});
         return;
     };
@@ -89,6 +123,7 @@ pub fn init(tw: *Tripwire, allocator: *std.mem.Allocator) void {
 }
 
 pub fn deinit(tw: *Tripwire) void {
+    tw.clearBreadCrumbs();
     tw.allocator.free(tw.errors);
     for (tw.payloads) |p| {
         switch (p) {
@@ -194,49 +229,76 @@ fn prettyPrintErrorCompact(err: Error) void {
 pub fn loopRecordErrors(tw: *Tripwire) void {
     while (true) {
         std.Thread.sleep(5_000_000_000);
-        if (recorded_error and tw.errors.len > errors_count - 1) {
-            prettyPrintError(tw.errors[errors_count - 1], tw.allocator.*) catch return;
-            recorded_error = false;
-            tw.sendErrors();
-        }
-        // if (errors_count == 512) {
-        //     tw.sendErrors();
-        // }
+
+        tw.mutex.lock();
+        const pending = tw.errors_count;
+        const has_new = tw.recorded_error;
+        const most_recent: ?Error = if (pending > 0) tw.errors[pending - 1] else null;
+        tw.recorded_error = false;
+        tw.mutex.unlock();
+
+        if (!has_new) continue;
+        if (most_recent) |err| prettyPrintError(err, tw.allocator.*) catch {};
+        tw.sendErrors();
     }
 }
 
 // Change this to inlcude and use the printFromSource within debug
 // std.debug.printSourceAtAddress(debug_info: *SelfInfo, out_stream: anytype, address: usize, tty_config: io.tty.Config)
+/// Buffers `err` for the next flush.
+///
+/// Errors arrive from request threads faster than the flush loop drains
+/// them, so the buffer is bounded: once full, further errors are counted in
+/// `dropped_errors` and discarded. Dropping diagnostics is preferable to
+/// writing past the end of `errors`.
 pub fn recordError(tw: *Tripwire, err: Error) void {
-    tw.errors[errors_count] = err;
-    errors_count += 1;
-    recorded_error = true;
+    tw.mutex.lock();
+    defer tw.mutex.unlock();
+
+    if (tw.errors_count >= tw.errors.len) {
+        tw.dropped_errors += 1;
+        return;
+    }
+
+    tw.errors[tw.errors_count] = err;
+    tw.errors_count += 1;
+    tw.recorded_error = true;
 }
 
 fn sendErrors(tw: *Tripwire) void {
-    for (0..errors_count) |i| {
-        const err_struct = tw.errors[i];
-        defer tw.allocator.free(err_struct.error_name);
-        defer tw.allocator.free(err_struct.function);
-        const payload = std.json.Stringify.valueAlloc(tw.allocator.*, err_struct, .{}) catch {
-            std.log.err("Could not stringify the payload for the errors", .{});
-            return;
-        };
-        tw.payloads[i] = Treehouse.ValueType{
-            .json = payload[0..],
-        };
-    }
+    // Take the buffered errors out under the lock so request threads can
+    // keep recording into a fresh buffer while this flush is in flight.
+    tw.mutex.lock();
+    const pending = tw.errors_count;
+    tw.errors_count = 0;
+    tw.mutex.unlock();
+
+    if (pending == 0) return;
+
+    // `built` tracks how many payloads this call actually created. Freeing
+    // `pending` of them instead would free stale entries left over from an
+    // earlier flush if stringifying stops short.
+    var built: usize = 0;
     defer {
-        for (0..errors_count) |i| {
-            const payload = tw.payloads[i];
+        for (tw.payloads[0..built]) |payload| {
             tw.allocator.free(payload.json);
         }
-        errors_count = 0;
     }
-    _ = tw.client.lpushmany(
-        "tripwire_error_logs",
-        tw.payloads[0..errors_count],
-    ) catch return;
+
+    for (tw.errors[0..pending]) |err_struct| {
+        defer tw.allocator.free(err_struct.error_name);
+        defer tw.allocator.free(err_struct.function);
+
+        const payload = std.json.Stringify.valueAlloc(tw.allocator.*, err_struct, .{}) catch {
+            std.log.err("Could not stringify the payload for the errors", .{});
+            break;
+        };
+        tw.payloads[built] = Treehouse.ValueType{ .json = payload };
+        built += 1;
+    }
+
+    if (built == 0) return;
+    _ = tw.client.lpushmany("tripwire_error_logs", tw.payloads[0..built]) catch return;
 }
 
 pub fn getErrors(tw: *Tripwire) ![]Error {
@@ -250,46 +312,136 @@ pub fn getErrors(tw: *Tripwire) ![]Error {
     return errors;
 }
 
-pub fn recordBreadCrumb(tw: *Tripwire) void {
-    var bread_crumb = BreadCrumbNode{
-        .data = .{ .event = .HTTP },
-    };
-    tw.breadcrumbs.prepend(&bread_crumb.node);
+/// Records a breadcrumb for the current request.
+///
+/// The node is heap-allocated: the list keeps the pointer after this
+/// function returns, so a stack local would dangle immediately.
+pub fn recordBreadCrumb(tw: *Tripwire, event: Event) !void {
+    tw.mutex.lock();
+    defer tw.mutex.unlock();
+
+    // Drop the oldest crumb once the cap is reached, so a long-running
+    // process keeps a bounded trail rather than growing forever.
+    if (tw.breadcrumb_count >= max_breadcrumbs) {
+        if (tw.breadcrumbs.popFirst()) |oldest| {
+            const node: *BreadCrumbNode = @fieldParentPtr("node", oldest);
+            tw.allocator.destroy(node);
+            tw.breadcrumb_count -= 1;
+        }
+    }
+
+    const node = try tw.allocator.create(BreadCrumbNode);
+    node.* = .{ .data = .{ .event = event } };
+    tw.breadcrumbs.prepend(&node.node);
+    tw.breadcrumb_count += 1;
 }
 
-test "lpushmanyAny" {
-    var allocator = std.testing.allocator;
-    var treehouse = try Treehouse.createClient(6401);
-    var _payloads = try allocator.alloc(Treehouse.ValueType, 1);
-    defer {
-        for (_payloads) |p| {
-            allocator.free(p.json);
-        }
-        allocator.free(_payloads);
+/// Frees every retained breadcrumb.
+fn clearBreadCrumbs(tw: *Tripwire) void {
+    while (tw.breadcrumbs.popFirst()) |first| {
+        const node: *BreadCrumbNode = @fieldParentPtr("node", first);
+        tw.allocator.destroy(node);
+    }
+    tw.breadcrumb_count = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+// Builds a Tripwire with its buffers but without the flush thread or the
+// Treehouse connection, so the buffering logic can be exercised on its own.
+fn testInstance(allocator: *std.mem.Allocator, capacity: usize) !Tripwire {
+    return .{
+        .allocator = allocator,
+        .errors = try allocator.alloc(Error, capacity),
+        .payloads = try allocator.alloc(Treehouse.ValueType, capacity),
+        .client = undefined,
+    };
+}
+
+fn destroyTestInstance(tw: *Tripwire) void {
+    tw.clearBreadCrumbs();
+    tw.allocator.free(tw.errors);
+    tw.allocator.free(tw.payloads);
+}
+
+test "recordError buffers errors up to capacity" {
+    var allocator = testing.allocator;
+    var tw = try testInstance(&allocator, 4);
+    defer destroyTestInstance(&tw);
+
+    for (0..3) |i| {
+        tw.recordError(.{ .line = @intCast(i), .error_name = "Boom" });
     }
 
-    for (0..1) |i| {
-        const err_struct = Error{
-            .line = 120,
-            .error_name = "HTTP",
-            .request = "/api/test",
-            .function = "createClient",
-            .timestamp = 101020201,
-            .file = "main.zig",
-        };
-        const payload = std.json.stringifyAlloc(allocator, err_struct, .{
-            .whitespace = .indent_1,
-        }) catch {
-            std.log.err("Could not stringify the payload for the errors", .{});
-            return;
-        };
-        _payloads[i] = Treehouse.ValueType{
-            .json = payload,
-        };
+    try testing.expectEqual(@as(usize, 3), tw.errors_count);
+    try testing.expectEqual(@as(usize, 0), tw.dropped_errors);
+    try testing.expect(tw.recorded_error);
+    try testing.expectEqual(@as(u32, 2), tw.errors[2].line);
+}
+
+// Without a bound, the 1025th error of a burst writes past the end of the
+// buffer. Errors are recorded from request handlers, so the burst is
+// remotely reachable.
+test "recordError drops overflow instead of writing past the buffer" {
+    var allocator = testing.allocator;
+    var tw = try testInstance(&allocator, 4);
+    defer destroyTestInstance(&tw);
+
+    for (0..10) |i| {
+        tw.recordError(.{ .line = @intCast(i), .error_name = "Boom" });
     }
 
-    // const resp = try treehouse.set("user:123", .{ .string = "content-1" });
-    // const resp = try treehouse.get("user:123");
-    const resp = try treehouse.del("user:123");
-    std.debug.print("{s}\n", .{resp});
+    try testing.expectEqual(@as(usize, 4), tw.errors_count);
+    try testing.expectEqual(@as(usize, 6), tw.dropped_errors);
+    // The retained errors are the first four, and none were corrupted.
+    for (0..4) |i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), tw.errors[i].line);
+    }
+}
+
+// The list holds each node after the recording call returns, so a
+// stack-allocated node would dangle. Reading the trail back proves the
+// nodes are still valid.
+test "breadcrumbs stay valid after the recording call returns" {
+    var allocator = testing.allocator;
+    var tw = try testInstance(&allocator, 4);
+    defer destroyTestInstance(&tw);
+
+    try tw.recordBreadCrumb(.HTTP);
+    try tw.recordBreadCrumb(.Query);
+    try tw.recordBreadCrumb(.HTTP);
+
+    try testing.expectEqual(@as(usize, 3), tw.breadcrumb_count);
+
+    // Most recent first, since each crumb is prepended.
+    const expected = [_]Event{ .HTTP, .Query, .HTTP };
+    var i: usize = 0;
+    var it = tw.breadcrumbs.first;
+    while (it) |n| : (it = n.next) {
+        const crumb: *BreadCrumbNode = @fieldParentPtr("node", n);
+        try testing.expectEqual(expected[i], crumb.data.event);
+        i += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), i);
+}
+
+test "breadcrumb trail is bounded" {
+    var allocator = testing.allocator;
+    var tw = try testInstance(&allocator, 4);
+    defer destroyTestInstance(&tw);
+
+    for (0..max_breadcrumbs + 50) |_| {
+        try tw.recordBreadCrumb(.HTTP);
+    }
+
+    try testing.expectEqual(max_breadcrumbs, tw.breadcrumb_count);
+
+    var counted: usize = 0;
+    var it = tw.breadcrumbs.first;
+    while (it) |n| : (it = n.next) counted += 1;
+    try testing.expectEqual(max_breadcrumbs, counted);
 }

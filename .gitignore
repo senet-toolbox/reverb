@@ -1,0 +1,15 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Vendored dependency cache
+zig-pkg/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
