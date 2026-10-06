@@ -41,7 +41,7 @@ Zig 0.16.0. Linux and macOS.
 ## Install
 
 ```sh
-zig fetch --save git+https://github.com/vic-Rokx/reverb.git
+zig fetch --save git+https://github.com/senet-toolbox/reverb.git
 ```
 
 Then in `build.zig`:
