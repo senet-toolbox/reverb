@@ -329,13 +329,17 @@ test "parse array json string" {
         \\}
     ;
 
+    var allocator = std.testing.allocator;
+
+    // Built with the testing allocator so the request itself is leak-checked
+    // too; it used to come from std.heap.c_allocator, which both forced a
+    // libc dependency on the test binary and was never freed.
     const req = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        allocator,
         "*3\r\n$7\r\nJSONSET\r\n$4\r\njson\r\n@{d}\r\n{s}\r\n",
         .{ json.len, json },
     );
-
-    var allocator = std.testing.allocator;
+    defer allocator.free(req);
     var resp = try Self.parse(req, &allocator);
     defer resp.deinit(allocator);
     try testing.expectEqualDeep(resp.toCommand(), Command{

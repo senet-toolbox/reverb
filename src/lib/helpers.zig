@@ -145,15 +145,20 @@ pub const HTTPHeader = struct {
     }
 };
 
-pub fn generateSessionId() ![]const u8 {
+/// Generates a random session id. Caller owns the returned memory.
+///
+/// Takes an allocator rather than reaching for `std.heap.c_allocator`,
+/// which forced a libc dependency and left every id it produced leaked.
+pub fn generateSessionId(allocator: std.mem.Allocator) ![]const u8 {
     var uuid_buf: [36]u8 = undefined;
     newV4().to_string(&uuid_buf);
 
-    const hash = try convertStringToSlice(&uuid_buf, std.heap.c_allocator);
-    return hash;
+    return convertStringToSlice(&uuid_buf, allocator);
 }
 
-pub fn parseSession(recv_data: []const u8) ![]const u8 {
+/// Returns the session id from the request's cookies, or a freshly
+/// generated one. Only the generated case allocates, from `allocator`.
+pub fn parseSession(allocator: std.mem.Allocator, recv_data: []const u8) ![]const u8 {
     const cookie = parseCookie(recv_data);
     if (cookie != null) {
         var cookie_itr = std.mem.splitSequence(u8, cookie.?, "=");
@@ -170,7 +175,7 @@ pub fn parseSession(recv_data: []const u8) ![]const u8 {
             cookie_itr.next();
         }
     }
-    return generateSessionId();
+    return generateSessionId(allocator);
 }
 
 fn parseCookie(header: []const u8) ?[]const u8 {

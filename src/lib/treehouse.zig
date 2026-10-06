@@ -5,6 +5,12 @@ const Parser = @import("parser.zig");
 const RESP = @import("RESP.zig").RESP;
 // const utils = @import("../utils/index.zig");
 
+// Every allocation here goes through `self.allocator`, set by
+// `createClient`. These used to use `std.heap.c_allocator`, which forced a
+// libc dependency on anything that linked this file and gave the caller no
+// way to choose or account for the memory. Note that the returned slices
+// are still the caller's to free.
+
 const ClientError = error{
     TreehouseRequestNotSupported,
     ValueNotFound,
@@ -119,7 +125,7 @@ pub fn echo(self: Self, value: []const u8) ![]const u8 {
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const req = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*2\r\n$4\r\nECHO\r\n${d}\r\n{s}\r\n",
         .{ value.len, value },
     );
@@ -135,7 +141,7 @@ pub fn echo(self: Self, value: []const u8) ![]const u8 {
     if (std.mem.eql(u8, resp, "-ERROR")) {
         return ClientError.TreehouseFailedToEcho;
     }
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -170,7 +176,7 @@ pub fn set(self: Self, key: []const u8, value_type: ValueType) ![]const u8 {
     }
 
     const response = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n{c}{d}\r\n{s}\r\n",
         .{ key.len, key, char, value.len, value },
     );
@@ -188,7 +194,7 @@ pub fn set(self: Self, key: []const u8, value_type: ValueType) ![]const u8 {
         return ClientError.FailedToSet;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
     // return ClientError.Success;
@@ -244,7 +250,7 @@ pub fn json_set(self: Self, key: []const u8, value: []const u8) ![]const u8 {
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const response = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*3\r\n$7\r\nJSONSET\r\n${d}\r\n{s}\r\n@{d}\r\n{s}\r\n",
         .{ key.len, key, value.len, value },
     );
@@ -261,7 +267,7 @@ pub fn json_set(self: Self, key: []const u8, value: []const u8) ![]const u8 {
         return ClientError.FailedToSet;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -293,7 +299,7 @@ pub fn json_get(self: Self, key: []const u8) ![]const u8 {
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const response = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*2\r\n$7\r\nJSONGET\r\n${d}\r\n{s}\r\n",
         .{ key.len, key },
     );
@@ -311,7 +317,7 @@ pub fn json_get(self: Self, key: []const u8) ![]const u8 {
     }
 
     const start = findIndex(&rbuf, '{').?;
-    const s = try std.heap.c_allocator.alloc(u8, nr - start);
+    const s = try self.allocator.alloc(u8, nr - start);
     std.mem.copyForwards(u8, s, rbuf[start..nr]);
     return s;
 }
@@ -320,7 +326,7 @@ pub fn get(self: Self, key: []const u8) ![]const u8 {
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const response = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n",
         .{ key.len, key },
     );
@@ -337,7 +343,7 @@ pub fn get(self: Self, key: []const u8) ![]const u8 {
         return ClientError.TreehouseFailedToGet;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -357,7 +363,7 @@ pub fn getAllKeys(self: Self) ![]const u8 {
         return ClientError.TreehouseFailedToGet;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -366,7 +372,7 @@ pub fn del(self: Self, key: []const u8) ![]const u8 {
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const response = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n",
         .{ key.len, key },
     );
@@ -383,7 +389,7 @@ pub fn del(self: Self, key: []const u8) ![]const u8 {
         return ClientError.TreehouseFailedToDel;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -420,7 +426,7 @@ pub fn lpush(self: Self, llname: []const u8, item_value: ValueType) ![]const u8 
     }
 
     const request = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n{c}{d}\r\n{s}\r\n",
         .{ llname.len, llname, char, item.len, item },
     );
@@ -437,7 +443,7 @@ pub fn lpush(self: Self, llname: []const u8, item_value: ValueType) ![]const u8 
         return ClientError.ValueNotFound;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr - 1);
+    const s = try self.allocator.alloc(u8, nr - 1);
     std.mem.copyForwards(u8, s, rbuf[1..nr]);
     return s;
 }
@@ -447,7 +453,7 @@ pub fn lrange(self: Self, ll_name: []const u8, start: []const u8, end: []const u
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const req = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*4\r\n$6\r\nLRANGE\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n",
         .{ ll_name.len, ll_name, start.len, start, end.len, end },
     );
@@ -467,7 +473,7 @@ pub fn lrange(self: Self, ll_name: []const u8, start: []const u8, end: []const u
         return ClientError.ValueNotFound;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -476,7 +482,7 @@ pub fn delElem(self: Self, ll_name: []const u8, index: []const u8) ![]const u8 {
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const req = try std.fmt.allocPrint(
-        std.heap.c_allocator,
+        self.allocator,
         "*3\r\n$7\r\nDELELEM\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n",
         .{ ll_name.len, ll_name, index.len, index },
     );
@@ -496,7 +502,7 @@ pub fn delElem(self: Self, ll_name: []const u8, index: []const u8) ![]const u8 {
         return ClientError.ValueNotFound;
     }
 
-    const s = try std.heap.c_allocator.alloc(u8, nr);
+    const s = try self.allocator.alloc(u8, nr);
     std.mem.copyForwards(u8, s, rbuf[0..nr]);
     return s;
 }
@@ -504,7 +510,7 @@ pub fn delElem(self: Self, ll_name: []const u8, index: []const u8) ![]const u8 {
 // "*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$3\r\none\r\n";
 // *4\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$4\r\nfive\r\n$3\r\nsix\r\n
 pub fn lpushmany(self: Self, llname: []const u8, items: []const ValueType) ![]const u8 {
-    const allocator = std.heap.c_allocator;
+    const allocator = self.allocator;
     const client_fd = try self.createConn();
     defer posix.close(client_fd);
     const precursor = try std.fmt.allocPrint(

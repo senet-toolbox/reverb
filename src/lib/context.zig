@@ -1924,7 +1924,10 @@ pub fn bind(self: *Self, comptime T: type, value: *T) !void {
     inline for (fields) |f| {
         if (f.type == []const u8) {
             const field_value = @field(parsed.value, f.name);
-            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, std.heap.c_allocator);
+            // `self.arena`, matching `glue` below. This used to be
+            // `std.heap.c_allocator`, which forced a libc dependency and
+            // allocated outside the request's arena, so it was never freed.
+            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.arena);
         }
     }
     value.* = parsed.value;

@@ -26,7 +26,6 @@ pub fn build(b: *std.Build) void {
     // libc, so removing pg broke the Linux build while macOS kept working,
     // because libSystem is linked there regardless. See context.md.
     const mod = b.addModule("reverb", .{
-        .link_libc = true,
         // `root_source_file` is the Zig "entry point" of the module. If a module
         // only contains e.g. external object files, you can make this `null`.
         // In this case the main source file is merely a path, however, in more
@@ -55,7 +54,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
         .imports = &.{
             .{ .name = "reverb", .module = mod },
             .{ .name = "loom", .module = loom_mod },
@@ -108,7 +106,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/readme_quickstart.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
             .imports = &.{
                 .{ .name = "reverb", .module = mod },
             },
@@ -132,7 +129,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
             .imports = &.{
                 .{ .name = "loom", .module = loom_mod },
             },
@@ -147,7 +143,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/integration.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
             .imports = &.{
                 .{ .name = "reverb", .module = mod },
                 .{ .name = "loom", .module = loom_mod },
@@ -162,6 +157,15 @@ pub fn build(b: *std.Build) void {
 
     const test_integration_step = b.step("test-integration", "Run integration tests");
     test_integration_step.dependOn(&run_integration_tests.step);
+
+    // Compiles the test binaries without running them, so a
+    // cross-compiled target can be checked for build errors the exe alone
+    // would not surface. An undeclared libc dependency lived only in the
+    // test graph once and `zig build -Dtarget=...` missed it, because the
+    // install step builds the executable and not the tests.
+    const test_compile_step = b.step("test-compile", "Compile the tests without running them");
+    test_compile_step.dependOn(&unit_tests.step);
+    test_compile_step.dependOn(&integration_tests.step);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit_tests.step);

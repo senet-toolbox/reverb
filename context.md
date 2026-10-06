@@ -30,9 +30,9 @@ See `README.md` for the public API.
 ## 2. Current state (verified 2026-10-05)
 
 ```
-19,247 lines of Zig across 55 files (after the pg split)
-      60 test blocks, all of which run
-      57 tests pass (42 unit, 15 integration)
+19,464 lines of Zig across 55 files (after the pg split)
+      67 test blocks, all of which run
+      64 tests pass (44 unit, 20 integration)
 ```
 
 - `zig build` succeeds. `zig build test` passes. `zig fmt --check` clean.
@@ -44,9 +44,11 @@ See `README.md` for the public API.
 - Graceful shutdown works: serves a request, exits 0 on SIGTERM, in both
   Debug and ReleaseSafe.
 - **Linux verified by execution**, not just compilation: both suites run
-  under `x86_64-linux-musl` in Docker (42 unit, 15 integration), so the
+  under `x86_64-linux-musl` in Docker (44 unit, 20 integration), so the
   epoll backend is genuinely exercised. All five cross-compile targets
-  build.
+  build both the exe and the test binaries.
+- **No libc dependency.** Builds and tests clean without `link_libc` on
+  every target.
 - `README.md` and `LICENSE` exist. The README quickstart is a real file
   (`examples/readme_quickstart.zig`) compiled by `zig build check-readme`
   and in CI, so it cannot rot.
@@ -85,24 +87,22 @@ it exits 127 and looks like a pass.
 
 ## 4. Remaining work
 
-1. **Pipelining is untested.** `expectedHttpRequestLength` returns only
-   the first request's length and a unit test covers that, but nothing
-   drives two requests in one `write()` over a socket and asserts two
-   responses come back. The most likely remaining framing bug.
-2. **29 `std.heap.c_allocator` call sites force a libc dependency** —
-   20 in `treehouse.zig`, 7 in `context.zig`, 1 each in `parser.zig` and
-   `helpers.zig`. `build.zig` declares `link_libc = true` to satisfy them.
-   Those functions do not take an allocator, so converting them is an API
-   change and was left as follow-up. Until then Reverb cannot build
-   libc-free.
+1. **Keep-alive response headers.** Responses do not set
+   `Connection: keep-alive` or advertise anything about connection reuse;
+   clients rely on HTTP/1.1 defaults. Worth auditing now that pipelining
+   works.
+2. **Four `std.heap.c_allocator` references remain**, all in
+   `context.zig`'s JSON-binding path (`parseJson`, `parseSlice`,
+   `parseArr`). They do not force a libc dependency today because those
+   functions are never analysed — and they cannot be, since `parseSlice`
+   uses `try` in a function whose return type is not an error union and
+   `@memcpy`s through a `*[]u8`. Fixing that path means repairing those
+   errors, not just swapping the allocator, so it was left alone.
 
-   This was hidden until now: the `pg` dependency linked libc, so removing
-   pg broke the Linux build while macOS kept passing, because libSystem is
-   linked on Darwin regardless. CI caught it; a `cross-compile` job now
-   catches this class without needing a PR run.
-3. **Chunked transfer-encoding is not implemented.** `Content-Length` is
-   the only body framing. A `Transfer-Encoding: chunked` request is
-   currently mis-framed rather than rejected — worth at least a 411.
+3. **Chunked transfer-encoding is still not implemented**, but it is now
+   refused rather than mis-framed: a request carrying a `Transfer-Encoding`
+   other than `identity`, or carrying both `Transfer-Encoding` and
+   `Content-Length`, gets a 411. Implementing it properly is open.
 4. **The modules below have no tests**, and were never compiled until
    this branch: `src/lib/auth/` (KeyStone, Github, Google),
    `src/lib/payment/Stripe.zig`, `src/lib/claude/`.

@@ -74,6 +74,11 @@ jobs:
       - name: Build for ${{ matrix.target }}
         run: zig build -Dtarget=${{ matrix.target }}
 
+      # The exe and the tests have different dependency graphs, so the
+      # tests get their own cross-compile check.
+      - name: Compile tests for ${{ matrix.target }}
+        run: zig build test-compile -Dtarget=${{ matrix.target }}
+
   lint:
     name: formatting
     runs-on: ubuntu-latest
