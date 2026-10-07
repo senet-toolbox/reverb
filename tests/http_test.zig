@@ -373,12 +373,24 @@ test "a whole request plus a partial one is handled correctly" {
     try testing.expectEqual(@as(u16, 200), try harness.statusCode(rest));
 }
 
-// A chunked request must be refused, not silently framed as having no
-// body. If it were, the chunk data would stay in the buffer and be read as
-// the next request on the connection — request smuggling, and the
-// pipelining support above makes that a live path rather than a
-// theoretical one.
-test "a chunked request is refused and its body is not smuggled" {
+// Chunked requests are decoded, and the handler sees the decoded bytes
+// rather than the chunk framing.
+test "a chunked request is decoded" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    const response = try h.roundTrip(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+    try testing.expectEqualStrings("hello world", try harness.body(response));
+}
+
+test "a chunked request split across packets is decoded" {
     const allocator = testing.allocator;
     var h = try Harness.start(allocator, &routes);
     defer h.stop();
@@ -386,19 +398,86 @@ test "a chunked request is refused and its body is not smuggled" {
     var conn = try h.connect();
     defer conn.close();
 
-    // The chunk payload is itself a valid request line. If the server
-    // mis-frames the chunked body, it would route this smuggled request.
-    try conn.writeAll(
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-            "2c\r\nGET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n\r\n0\r\n\r\n",
-    );
+    const request = "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n";
+
+    // Split mid-chunk, so neither half frames on its own.
+    try conn.writeAll(request[0 .. request.len - 12]);
+    harness.sleepMs(20);
+    try conn.writeAll(request[request.len - 12 ..]);
 
     const response = try conn.readResponse(allocator);
     defer allocator.free(response);
 
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+    try testing.expectEqualStrings("hello world", try harness.body(response));
+}
+
+// A chunked request followed by another request on the same connection.
+// If the chunked body were mis-framed, the following request's bytes would
+// be swallowed into it, or its own bytes read as a smuggled request.
+test "a request after a chunked one is still served" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "3\r\nabc\r\n0\r\n\r\n" ++
+            "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+
+    const response = try conn.readResponses(allocator, 2);
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(usize, 2), harness.countResponses(response));
+    try testing.expect(std.mem.indexOf(u8, response, "abc") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "pong") != null);
+}
+
+test "an empty chunked body is served as an empty payload" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    const response = try h.roundTrip(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+    try testing.expectEqualStrings("", try harness.body(response));
+}
+
+test "a chunked body with trailers is decoded and the trailers ignored" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    const response = try h.roundTrip(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "3\r\nabc\r\n0\r\nX-Checksum: deadbeef\r\n\r\n",
+    );
+    defer allocator.free(response);
+
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+    try testing.expectEqualStrings("abc", try harness.body(response));
+}
+
+test "an unsupported transfer coding is refused" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    const response = try h.roundTrip(
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n",
+    );
+    defer allocator.free(response);
+
     try testing.expectEqual(@as(u16, 411), try harness.statusCode(response));
-    // The smuggled request was never served.
-    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, response, "pong"));
 }
 
 test "a request declaring both Content-Length and Transfer-Encoding is refused" {
@@ -413,4 +492,221 @@ test "a request declaring both Content-Length and Transfer-Encoding is refused" 
     defer allocator.free(response);
 
     try testing.expectEqual(@as(u16, 411), try harness.statusCode(response));
+}
+
+// A client that sends `Connection: close` is telling the server it will not
+// reuse the connection. Leaving it open holds one of the `max` connection
+// slots until the idle timeout, so a client sending many such requests can
+// occupy the whole table while doing nothing wrong.
+test "Connection: close is honoured" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+    const response = try conn.readResponse(allocator);
+    defer allocator.free(response);
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+
+    try testing.expect(try conn.peerClosed(500));
+}
+
+// Without the header, HTTP/1.1 defaults to keep-alive and the connection
+// must stay usable.
+test "a connection without Connection: close stays open" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const response = try conn.readResponse(allocator);
+    defer allocator.free(response);
+
+    try testing.expect(!try conn.peerClosed(300));
+
+    // And it really is still usable.
+    try conn.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const second = try conn.readResponse(allocator);
+    defer allocator.free(second);
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(second));
+}
+
+// A 404 is an ordinary response to a well-formed request, not a
+// connection-level failure. Tearing the connection down makes a client
+// reconnect for every missing route, and it contradicts the keep-alive the
+// request asked for.
+test "a 404 does not close a keep-alive connection" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll("GET /nothing-here HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const missing = try conn.readResponse(allocator);
+    defer allocator.free(missing);
+    try testing.expectEqual(@as(u16, 404), try harness.statusCode(missing));
+
+    try testing.expect(!try conn.peerClosed(300));
+
+    // The connection is still good for a real request.
+    try conn.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const ok = try conn.readResponse(allocator);
+    defer allocator.free(ok);
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(ok));
+    try testing.expectEqualStrings("pong", try harness.body(ok));
+}
+
+// A malformed request is different: the connection's framing is no longer
+// trustworthy, so closing is the right move and the response says so.
+test "a malformed request closes the connection" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    var conn = try h.connect();
+    defer conn.close();
+
+    try conn.writeAll("NOTAMETHOD / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const response = try conn.readResponse(allocator);
+    defer allocator.free(response);
+
+    try testing.expect(try harness.statusCode(response) >= 400);
+    try testing.expect(try conn.peerClosed(500));
+}
+
+// Every response path has to report the same connection handling the server
+// actually performs, or a client reuses a socket the server has dropped (or
+// abandons one it could have kept).
+test "the Connection response header matches what the server does" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    const Case = struct {
+        name: []const u8,
+        request: []const u8,
+        expect_close: bool,
+    };
+
+    for ([_]Case{
+        .{
+            .name = "200 keep-alive",
+            .request = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            .expect_close = false,
+        },
+        .{
+            .name = "200 close",
+            .request = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            .expect_close = true,
+        },
+        .{
+            .name = "404 keep-alive",
+            .request = "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            .expect_close = false,
+        },
+        .{
+            .name = "404 close",
+            .request = "GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            .expect_close = true,
+        },
+        .{
+            .name = "OPTIONS keep-alive",
+            .request = "OPTIONS /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            .expect_close = false,
+        },
+        .{
+            .name = "OPTIONS close",
+            .request = "OPTIONS /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            .expect_close = true,
+        },
+    }) |case| {
+        var conn = try h.connect();
+        defer conn.close();
+
+        try conn.writeAll(case.request);
+        const response = try conn.readResponse(allocator);
+        defer allocator.free(response);
+
+        const says_close = std.mem.indexOf(u8, response, "Connection: close") != null;
+        const actually_closed = try conn.peerClosed(400);
+
+        // What it says and what it does have to agree, and both have to
+        // match what was asked for.
+        testing.expectEqual(case.expect_close, says_close) catch |err| {
+            std.debug.print("case '{s}': header mismatch\n", .{case.name});
+            return err;
+        };
+        testing.expectEqual(case.expect_close, actually_closed) catch |err| {
+            std.debug.print("case '{s}': behaviour mismatch\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+// HTTP/1.0 closes by default; keep-alive there is opt-in.
+test "an HTTP/1.0 request closes unless it asks to stay open" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    {
+        var conn = try h.connect();
+        defer conn.close();
+        try conn.writeAll("GET /ping HTTP/1.0\r\nHost: localhost\r\n\r\n");
+        const response = try conn.readResponse(allocator);
+        defer allocator.free(response);
+        try testing.expect(try conn.peerClosed(400));
+    }
+
+    {
+        var conn = try h.connect();
+        defer conn.close();
+        try conn.writeAll("GET /ping HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+        const response = try conn.readResponse(allocator);
+        defer allocator.free(response);
+        try testing.expect(!try conn.peerClosed(300));
+    }
+}
+
+// A duplicated Connection header is a protocol error, and the kind of thing
+// that happens when the value is emitted both in a status-line template and
+// in the shared header builder.
+test "responses carry exactly one Connection header" {
+    const allocator = testing.allocator;
+    var h = try Harness.start(allocator, &routes);
+    defer h.stop();
+
+    for ([_][]const u8{
+        "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "OPTIONS /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nhi",
+    }) |request| {
+        const response = try h.roundTrip(request);
+        defer allocator.free(response);
+
+        const head_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse
+            return error.MalformedResponse;
+        const head = response[0..head_end];
+
+        var count: usize = 0;
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        _ = lines.next(); // status line
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "Connection")) {
+                count += 1;
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
 }
