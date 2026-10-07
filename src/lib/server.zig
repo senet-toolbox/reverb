@@ -1087,10 +1087,24 @@ pub fn Server(comptime Config: type) type {
                 @memcpy(recv_buf[0..request_len], pending[0..request_len]);
                 request_buffer.consume(request_len);
 
+                // A chunked body is decoded in place, so handlers always see
+                // the real bytes rather than the chunk framing. The decoded
+                // length replaces the absent Content-Length.
+                var body_len: ?usize = null;
+                const head_end = helpers.findCRLFCRLF(recv_buf[0..request_len]);
+                if (head_end) |end| {
+                    if (helpers.isChunked(recv_buf[0..end])) {
+                        body_len = helpers.decodeChunkedBody(recv_buf[end + 4 .. request_len]) catch |err| {
+                            try respondToFramingError(ctx, err);
+                            return err;
+                        };
+                    }
+                }
+
                 // Each pipelined request gets a clean context.
                 ctx.clear();
                 ctx.client = client;
-                try serveRequest(reverb, client, ctx, recv_buf[0..request_len]);
+                try serveRequest(reverb, client, ctx, recv_buf[0..request_len], body_len);
             }
 
             return;
@@ -1105,8 +1119,8 @@ pub fn Server(comptime Config: type) type {
                 error.HeaderTooLarge => "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
                     "Content-Type: text/html\r\n" ++
                     "Content-Length: 0\r\n\r\n",
-                // Chunked bodies are not implemented. 411 tells the client
-                // to send a Content-Length instead of leaving it to guess.
+                // `chunked` is supported; any other coding is not. 411 tells
+                // the client to send a Content-Length instead of guessing.
                 error.UnsupportedTransferEncoding => "HTTP/1.1 411 Length Required\r\n" ++
                     "Content-Type: text/html\r\n" ++
                     "Content-Length: 0\r\n" ++
@@ -1121,12 +1135,15 @@ pub fn Server(comptime Config: type) type {
         /// Parses and routes one complete request.
         ///
         /// `request_data` holds exactly one request, already framed by
-        /// `handle`.
+        /// `handle`. `decoded_body_len`, when set, is the length of a
+        /// chunked body that `handle` has already decoded in place, and
+        /// stands in for the `Content-Length` such a request does not carry.
         fn serveRequest(
             reverb: *Reverb,
             client: *Client,
             ctx: *Context,
             request_data: []const u8,
+            decoded_body_len: ?usize,
         ) !void {
             var ctx_pm = Ctx_pm{};
             ctx.client.?.msg = request_data;
@@ -1164,10 +1181,11 @@ pub fn Server(comptime Config: type) type {
                 return;
             }
 
-            if (http_header.content_length > 0) {
-                ctx.content_length = http_header.content_length;
-                if (http_header.body.len < http_header.content_length) return error.MalformedRequest;
-                ctx.payload = http_header.body[0..http_header.content_length];
+            const body_len = decoded_body_len orelse http_header.content_length;
+            if (body_len > 0) {
+                ctx.content_length = body_len;
+                if (http_header.body.len < body_len) return error.MalformedRequest;
+                ctx.payload = http_header.body[0..body_len];
                 ctx.http_payload = ctx.payload;
             }
 

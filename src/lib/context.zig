@@ -59,7 +59,10 @@ pub const Param = struct {
 pub const Self = @This();
 id: usize = 10000,
 arena: std.mem.Allocator,
-payload: []const u8 = undefined,
+/// The request body. Empty when the request carried none — never
+/// `undefined`, because handlers read this without checking
+/// `content_length` first.
+payload: []const u8 = "",
 http_header: helpers.HTTPHeader = .{},
 req_params_index: usize = 0,
 params: []Param = undefined, // Array of key-value pairs for URL parameters
@@ -160,6 +163,10 @@ pub fn clear(self: *Self) void {
     self.req_query_params_index = 0;
     self.req_cookie_index = 0;
     self.content_length = 0;
+    // Both of these must be cleared: contexts are pooled and reused per
+    // connection slot, so a stale payload would otherwise be visible to the
+    // next request that happens not to carry a body.
+    self.payload = "";
     self.http_payload = "";
     self.content_type = helpers.ContentType.None;
     self.header_buf = undefined;

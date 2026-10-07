@@ -278,11 +278,24 @@ fn parseHeaderContentLength(headers: []const u8) !usize {
     return 0;
 }
 
-/// True when the head declares a transfer coding this server cannot frame.
+/// How a request's body is framed.
+pub const BodyFraming = enum {
+    /// `Content-Length`, or no body at all.
+    length,
+    /// `Transfer-Encoding: chunked`.
+    chunked,
+};
+
+/// Decides how the head says the body is framed.
 ///
-/// `identity` is excluded because it means "no encoding applied" and so
-/// leaves `Content-Length` in charge of framing.
-fn hasUnsupportedTransferEncoding(headers: []const u8) bool {
+/// `identity` means "no encoding applied", so it leaves `Content-Length` in
+/// charge. Anything else is rejected: a coding this server cannot decode
+/// must not be treated as a zero-length body, because the undecoded bytes
+/// would then be read as the next request on the connection.
+fn bodyFraming(headers: []const u8) !BodyFraming {
+    var framing: BodyFraming = .length;
+    var saw_transfer_encoding = false;
+
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
     _ = lines.next(); // request line
 
@@ -293,10 +306,132 @@ fn hasUnsupportedTransferEncoding(headers: []const u8) bool {
 
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(value, "identity")) continue;
-        return true;
+        if (!std.ascii.eqlIgnoreCase(value, "chunked")) {
+            return error.UnsupportedTransferEncoding;
+        }
+        saw_transfer_encoding = true;
+        framing = .chunked;
     }
 
+    // Both headers together is the classic smuggling setup: two parties can
+    // disagree about which one frames the body.
+    if (saw_transfer_encoding and hasContentLength(headers)) {
+        return error.UnsupportedTransferEncoding;
+    }
+
+    return framing;
+}
+
+fn hasContentLength(headers: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) return true;
+    }
     return false;
+}
+
+/// True when the head declares `Transfer-Encoding: chunked`.
+///
+/// Only meaningful on a head that `expectedHttpRequestLength` has already
+/// accepted, which is where an unsupported coding is rejected.
+pub fn isChunked(headers: []const u8) bool {
+    return (bodyFraming(headers) catch return false) == .chunked;
+}
+
+/// Parses a chunk-size line, ignoring any `;ext=val` suffix.
+fn parseChunkSize(line: []const u8) !usize {
+    const end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+    const digits = std.mem.trim(u8, line[0..end], " \t");
+    if (digits.len == 0) return error.MalformedRequest;
+    return std.fmt.parseInt(usize, digits, 16) catch error.MalformedRequest;
+}
+
+/// Measures a chunked body.
+///
+/// `body` starts at the first chunk-size line. Returns how many bytes the
+/// whole encoded body occupies — every chunk, the terminating zero chunk,
+/// any trailers and the final CRLF — along with how much data it decodes
+/// to. Returns null while the body is still incomplete.
+///
+/// `max_body_size` is checked against the *decoded* size, because that is
+/// what a handler is handed.
+fn chunkedBodyExtent(body: []const u8, max_body_size: usize) !?struct {
+    encoded_len: usize,
+    decoded_len: usize,
+} {
+    var pos: usize = 0;
+    var decoded: usize = 0;
+
+    while (true) {
+        // Chunk size line.
+        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse {
+            // Guard against a client dribbling an endless size line.
+            if (body.len - pos > MAX_HEADER_SIZE) return error.HeaderTooLarge;
+            return null;
+        };
+        const size = try parseChunkSize(body[pos..line_end]);
+        pos = line_end + 2;
+
+        if (size == 0) {
+            // Terminating chunk, then optional trailers, then a blank line.
+            const trailers_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse {
+                if (body.len - pos > MAX_HEADER_SIZE) return error.HeaderTooLarge;
+                return null;
+            };
+            if (trailers_end == pos) {
+                // No trailers: the CRLF just found closes the body.
+                return .{ .encoded_len = pos + 2, .decoded_len = decoded };
+            }
+            // Trailers present; they end at a blank line.
+            const end = std.mem.indexOfPos(u8, body, pos, "\r\n\r\n") orelse {
+                if (body.len - pos > MAX_HEADER_SIZE) return error.HeaderTooLarge;
+                return null;
+            };
+            return .{ .encoded_len = end + 4, .decoded_len = decoded };
+        }
+
+        // Refuse before the addition can wrap.
+        if (size > max_body_size or decoded > max_body_size - size) {
+            return error.BodyTooLarge;
+        }
+        decoded += size;
+
+        // Chunk data, then its own CRLF.
+        if (body.len < pos + size + 2) return null;
+        if (!std.mem.eql(u8, body[pos + size .. pos + size + 2], "\r\n")) {
+            return error.MalformedRequest;
+        }
+        pos += size + 2;
+    }
+}
+
+/// Decodes a chunked body in place, returning the decoded length.
+///
+/// `body` must be exactly one complete chunked body, as measured by
+/// `chunkedBodyExtent`. Decoding in place is sound because the encoding is
+/// always strictly larger than what it encodes: every chunk carries a size
+/// line and a trailing CRLF, so the read position stays ahead of the write
+/// position throughout.
+pub fn decodeChunkedBody(body: []u8) !usize {
+    var read: usize = 0;
+    var write: usize = 0;
+
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, body, read, "\r\n") orelse
+            return error.MalformedRequest;
+        const size = try parseChunkSize(body[read..line_end]);
+        read = line_end + 2;
+
+        if (size == 0) return write;
+
+        if (body.len < read + size + 2) return error.MalformedRequest;
+        std.mem.copyForwards(u8, body[write .. write + size], body[read .. read + size]);
+        write += size;
+        read += size + 2;
+    }
 }
 
 /// How many bytes make up the first complete request in `payload`, or null
@@ -313,13 +448,13 @@ pub fn expectedHttpRequestLength(payload: []const u8, max_body_size: usize) !?us
     const header_len = headers_end + 4;
     if (header_len > MAX_HEADER_SIZE) return error.HeaderTooLarge;
 
-    // Refused rather than ignored. A chunked body framed as zero-length
-    // would leave the chunk data in the buffer to be parsed as the next
-    // request on a keep-alive connection — request smuggling. The same
-    // applies when both Transfer-Encoding and Content-Length are present,
-    // since two parties can then disagree about which one frames the body.
-    if (hasUnsupportedTransferEncoding(payload[0..headers_end])) {
-        return error.UnsupportedTransferEncoding;
+    switch (try bodyFraming(payload[0..headers_end])) {
+        .chunked => {
+            const extent = try chunkedBodyExtent(payload[header_len..], max_body_size) orelse
+                return null;
+            return header_len + extent.encoded_len;
+        },
+        .length => {},
     }
 
     const content_length = try parseHeaderContentLength(payload[0..headers_end]);
@@ -1199,27 +1334,33 @@ test "expectedHttpRequestLength frames requests correctly" {
     try testing.expectError(error.HeaderTooLarge, expectedHttpRequestLength(giant, max_body));
 }
 
-// `Transfer-Encoding` is not implemented, and the danger is not that it is
-// missing but that it is ignored: a chunked body would be framed as
-// zero-length, leaving the chunk data in the buffer to be read as the
-// *next* request on a keep-alive connection. That is request smuggling.
-// Both these cases must be refused.
-test "a chunked request is refused rather than mis-framed" {
+// `chunked` is supported. Any other coding is refused rather than ignored:
+// treating an undecodable body as zero-length would leave its bytes in the
+// buffer to be read as the next request on a keep-alive connection, which
+// is request smuggling.
+test "an unsupported transfer coding is refused" {
     const max_body = 1024;
 
-    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
-        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
-        max_body,
-    ));
+    for ([_][]const u8{
+        "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: deflate\r\n\r\n",
+        // A chunked-plus-other list is not plain `chunked`.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+    }) |payload| {
+        try testing.expectError(
+            error.UnsupportedTransferEncoding,
+            expectedHttpRequestLength(payload, max_body),
+        );
+    }
 
-    // Header name casing is not significant.
-    try testing.expectError(error.UnsupportedTransferEncoding, expectedHttpRequestLength(
-        "POST / HTTP/1.1\r\ntransfer-encoding: CHUNKED\r\n\r\n0\r\n\r\n",
-        max_body,
-    ));
+    // Casing is not significant, and `chunked` is accepted.
+    const chunked = "POST / HTTP/1.1\r\ntransfer-encoding: CHUNKED\r\n\r\n0\r\n\r\n";
+    try testing.expectEqual(
+        @as(?usize, chunked.len),
+        try expectedHttpRequestLength(chunked, max_body),
+    );
 
-    // `identity` is the one encoding that means "no encoding", so it is
-    // not a framing hazard and stays allowed.
+    // `identity` means no encoding, so `Content-Length` still frames.
     const identity = "POST / HTTP/1.1\r\nTransfer-Encoding: identity\r\nContent-Length: 2\r\n\r\nhi";
     try testing.expectEqual(
         @as(?usize, identity.len),
@@ -1234,4 +1375,156 @@ test "a request with both Transfer-Encoding and Content-Length is refused" {
         "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
         1024,
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Chunked transfer-encoding
+// ---------------------------------------------------------------------------
+
+test "chunked framing reports the length of the whole encoded body" {
+    const max_body = 1024;
+
+    // One chunk, then the terminator.
+    const one = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    try testing.expectEqual(@as(?usize, one.len), try expectedHttpRequestLength(one, max_body));
+
+    // Several chunks.
+    const many = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n";
+    try testing.expectEqual(@as(?usize, many.len), try expectedHttpRequestLength(many, max_body));
+
+    // A chunk-size extension is legal and ignored.
+    const ext = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;a=b\r\nhello\r\n0\r\n\r\n";
+    try testing.expectEqual(@as(?usize, ext.len), try expectedHttpRequestLength(ext, max_body));
+
+    // Trailers after the terminating chunk are part of the request.
+    const trailer = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n";
+    try testing.expectEqual(@as(?usize, trailer.len), try expectedHttpRequestLength(trailer, max_body));
+
+    // Hex sizes, upper and lower case.
+    const hex = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "A\r\n0123456789\r\nf\r\n012345678901234\r\n0\r\n\r\n";
+    try testing.expectEqual(@as(?usize, hex.len), try expectedHttpRequestLength(hex, max_body));
+}
+
+test "an incomplete chunked body reports not-yet rather than a length" {
+    const max_body = 1024;
+
+    for ([_][]const u8{
+        // No chunks at all yet.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        // Chunk size line not finished.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n",
+        // Chunk data short.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+        // Data complete but its trailing CRLF missing.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello",
+        // Terminating chunk present but the final CRLF missing.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n",
+        // Trailer section unterminated.
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Sum: 1\r\n",
+    }) |payload| {
+        try testing.expectEqual(
+            @as(?usize, null),
+            try expectedHttpRequestLength(payload, max_body),
+        );
+    }
+}
+
+test "malformed chunk framing is refused" {
+    const max_body = 1024;
+
+    // A chunk size that is not hex.
+    try testing.expectError(error.MalformedRequest, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
+        max_body,
+    ));
+
+    // Chunk data not followed by CRLF.
+    try testing.expectError(error.MalformedRequest, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+        max_body,
+    ));
+
+    // An empty chunk-size line.
+    try testing.expectError(error.MalformedRequest, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\nhello\r\n0\r\n\r\n",
+        max_body,
+    ));
+}
+
+// The decoded size is what counts against the limit, not the encoded size,
+// since the decoded bytes are what a handler is handed.
+test "a chunked body over the limit is refused" {
+    try testing.expectError(error.BodyTooLarge, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n",
+        8,
+    ));
+
+    // A chunk size that would overflow the accumulator is refused, not wrapped.
+    try testing.expectError(error.BodyTooLarge, expectedHttpRequestLength(
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n",
+        1024,
+    ));
+}
+
+test "decodeChunkedBody concatenates the chunk data" {
+    var buf: [64]u8 = undefined;
+
+    const single = "5\r\nhello\r\n0\r\n\r\n";
+    @memcpy(buf[0..single.len], single);
+    try testing.expectEqualStrings("hello", buf[0..try decodeChunkedBody(buf[0..single.len])]);
+
+    const multi = "5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n";
+    @memcpy(buf[0..multi.len], multi);
+    try testing.expectEqualStrings("hello world", buf[0..try decodeChunkedBody(buf[0..multi.len])]);
+
+    // A body of nothing but the terminator decodes to zero bytes.
+    const empty = "0\r\n\r\n";
+    @memcpy(buf[0..empty.len], empty);
+    try testing.expectEqual(@as(usize, 0), try decodeChunkedBody(buf[0..empty.len]));
+
+    // Extensions and trailers contribute no data.
+    const extras = "3;x=y\r\nabc\r\n0\r\nX-Sum: 3\r\n\r\n";
+    @memcpy(buf[0..extras.len], extras);
+    try testing.expectEqualStrings("abc", buf[0..try decodeChunkedBody(buf[0..extras.len])]);
+}
+
+// Decoding happens in place, which is only sound because the encoding is
+// always larger than what it encodes -- every chunk carries at least a size
+// line and a trailing CRLF. This pins that assumption down.
+test "in-place decoding never outgrows its input" {
+    var buf: [512]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    const random = prng.random();
+
+    for (0..500) |_| {
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(testing.allocator);
+        var expected: std.ArrayList(u8) = .empty;
+        defer expected.deinit(testing.allocator);
+
+        const chunks = random.uintLessThan(usize, 5) + 1;
+        for (0..chunks) |_| {
+            const size = random.uintLessThan(usize, 20) + 1;
+            var data: [20]u8 = undefined;
+            for (data[0..size]) |*byte| byte.* = random.intRangeAtMost(u8, 'a', 'z');
+
+            var head: [16]u8 = undefined;
+            const head_str = try std.fmt.bufPrint(&head, "{x}\r\n", .{size});
+            try encoded.appendSlice(testing.allocator, head_str);
+            try encoded.appendSlice(testing.allocator, data[0..size]);
+            try encoded.appendSlice(testing.allocator, "\r\n");
+            try expected.appendSlice(testing.allocator, data[0..size]);
+        }
+        try encoded.appendSlice(testing.allocator, "0\r\n\r\n");
+
+        @memcpy(buf[0..encoded.items.len], encoded.items);
+        const decoded_len = try decodeChunkedBody(buf[0..encoded.items.len]);
+
+        try testing.expect(decoded_len <= encoded.items.len);
+        try testing.expectEqualStrings(expected.items, buf[0..decoded_len]);
+    }
 }
