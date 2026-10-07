@@ -27,12 +27,12 @@ See `README.md` for the public API.
 
 ---
 
-## 2. Current state (verified 2026-10-05)
+## 2. Current state (verified 2026-10-07)
 
 ```
-19,464 lines of Zig across 55 files (after the pg split)
-      67 test blocks, all of which run
-      64 tests pass (44 unit, 20 integration)
+16,267 lines of Zig across 46 files (after the package splits)
+      61 test blocks, all of which run
+      58 tests pass (38 unit, 20 integration)
 ```
 
 - `zig build` succeeds. `zig build test` passes. `zig fmt --check` clean.
@@ -103,20 +103,22 @@ it exits 127 and looks like a pass.
    refused rather than mis-framed: a request carrying a `Transfer-Encoding`
    other than `identity`, or carrying both `Transfer-Encoding` and
    `Content-Length`, gets a 411. Implementing it properly is open.
-4. **The modules below have no tests**, and were never compiled until
-   this branch: `src/lib/auth/` (KeyStone, Github, Google),
-   `src/lib/payment/Stripe.zig`, `src/lib/claude/`.
-5. **Several files are reachable from nothing** — kept deliberately, they
-   are wanted later: `src/lib/core/Url.zig`, `src/lib/payment/Stripe.zig`,
-   `src/lib/claude/{API,VERTEX}.zig`, `src/lib/core/Providers.zig`,
-   `src/error_index.zig`, `src/assembler/`, `src/execute/`,
-   `src/errors/`, `src/sample/sample.zig`.
+4. **Several files are reachable from nothing** — kept deliberately, they
+   are wanted later: `src/lib/core/Url.zig`, `src/lib/core/Providers.zig`,
+   `src/error_index.zig`, `src/assembler/`, `src/execute/`, `src/errors/`,
+   `src/sample/sample.zig`.
 
-   Note that five of them still `@import("pg")` or `@import("pg_orm")`:
-   `error_index.zig`, `assembler/crud.zig`, `execute/handlers.zig`,
-   `execute/queries.zig`, `errors/store.zig`. That compiles today only
-   because nothing reaches them. Wiring any of them up means adding the
-   `pg_orm` package (§5) back as a dependency.
+   Five still `@import("pg")` or `@import("pg_orm")`: `error_index.zig`,
+   `assembler/crud.zig`, `execute/{handlers,queries}.zig` and
+   `errors/store.zig`. That compiles only because nothing reaches them.
+   Wiring any of them up means taking `pg-orm` as a dependency.
+
+5. **The websocket layer and Treehouse have no tests.** `src/lib/wss.zig`
+   and `src/lib/treehouse.zig` are the last substantial pieces inside
+   reverb that nothing exercises. Treehouse also needs a running cache
+   server on port 6401, which is why its one test was removed rather than
+   fixed.
+
 6. **`Cluster` for multi-worker throughput.** Loom measured 5.16× at 8
    workers. Do this last: the handler is per-worker, so `*Reverb` shared
    across workers needs a thread-safety audit — `arena`, `routes`,
@@ -128,20 +130,44 @@ it exits 127 and looks like a pass.
 
 ---
 
-## 5. The pg ORM is now its own package
+## 5. What moved out of reverb
 
-`src/pg` (4,357 lines) and its two examples moved to
-`../pg-orm` — Reverb is an HTTP server and has no business carrying a
-database layer. The directory is a standalone repo with its own
-`build.zig`, one local commit, **no remote yet**.
+Reverb's scope is the HTTP layer. Four packages were split out, each a
+repo under `senet-toolbox` with its own `build.zig`:
 
-Its 29 test blocks had never been wired into a build step either, so they
-had never run. Enabling them needed one fix (`std.io.fixedBufferStream`,
-removed in 0.16). **30 tests pass.** Coverage is the query builders only;
-`Connection.zig` and `result.zig` still need a live database.
+| Package | Lines | Depends on |
+| --- | --- | --- |
+| `pg-orm` | 4,357 | pg.zig |
+| `reverb-auth` | ~1,700 | reverb |
+| `claude-zig` | 548 | std only |
+| `stripe-zig` | 376 | std only |
 
-Reverb's `build.zig` and `build.zig.zon` no longer reference `pg` at all,
-and the suite is still 52/52 without it — verified.
+None of this code had ever been compiled, apart from pg-orm's tests and
+the JWT tests, because none of it was reachable from a build root. Forcing
+analysis with `refAllDecls` surfaced:
+
+- `std.posix.getenv` (removed in 0.16) in Stripe and Claude, both in demo
+  `main` functions that sat *inside* the library files — so a consumer
+  would link a second entry point and the library read the environment.
+  Those moved to `examples/`.
+- `claude.chat()` hardcoded `@embedFile("context_v2.txt")` as its system
+  prompt: a 20 KB prompt for an unrelated UI framework, sent on every call
+  and billed as input tokens. The caller supplies it now.
+- `QueryBuilder.remove` referenced `query_param_list`, a field that does
+  not exist.
+- **A hardcoded JWT signing secret** committed in `KeyStone.zig`, used as
+  a silent fallback whenever `session_secret` was unset. Anyone with the
+  source could mint a session for any user of such a deployment. Removed;
+  a missing secret is now an error. **Any deployment that ran on the
+  default needs its secret rotated and its sessions invalidated.**
+- `std.io.fixedBufferStream` (removed in 0.16) in a pg-orm test.
+
+`reverb-auth` depends on reverb by **path**, not a pinned URL, because
+`senet-toolbox/reverb` is private and `zig fetch` cannot reach it without
+credentials. It therefore needs a sibling checkout. Pin it properly once
+reverb is public or CI has a token.
+
+`reverb.JWT` and `reverb.KeyStone` are gone from the public API.
 
 ---
 
