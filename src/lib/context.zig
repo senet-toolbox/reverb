@@ -59,6 +59,14 @@ pub const Param = struct {
 pub const Self = @This();
 id: usize = 10000,
 arena: std.mem.Allocator,
+/// Scratch memory for one request, reset by `clear()`.
+///
+/// `arena` is the server's allocator and lives for the whole process, so
+/// anything a handler allocates from it is retained until shutdown. That
+/// made JSON binding cost ~38 bytes per request, permanently. Request-scoped
+/// allocations belong here instead; the capacity is retained across resets,
+/// so steady state costs no allocator traffic at all.
+request_arena: *std.heap.ArenaAllocator,
 /// The request body. Empty when the request carried none — never
 /// `undefined`, because handlers read this without checking
 /// `content_length` first.
@@ -96,6 +104,9 @@ pub fn init(
     _: ?[]const u8,
     cookie_size: usize,
 ) !Self {
+    const request_arena = try arena.create(std.heap.ArenaAllocator);
+    request_arena.* = std.heap.ArenaAllocator.init(arena);
+
     const parser = try arena.create(dom.Parser);
     parser.* = try dom.Parser.initFixedBuffer(arena, "", .{});
     const req_cookies = try arena.alloc(Cookie, cookie_size);
@@ -110,6 +121,7 @@ pub fn init(
 
     return Self{
         .arena = arena,
+        .request_arena = request_arena,
         .method = method,
         .route = route,
         .params = params,
@@ -124,38 +136,46 @@ pub fn init(
     };
 }
 
-pub fn deinit(self: *Self) !void {
-    // Free the dynamically allocated memory for all hashmaps
-
-    // Free params
-    // self.params.deinit();
-
-    // Free query_params
-    // self.query_params.deinit();
-
-    // Free form_params
-    // We must add this here since we always assume value is a owned created string
+/// Releases everything `init` allocated.
+///
+/// `Server.deinit` calls this for every pooled context. It previously had
+/// most of its body commented out and no caller at all, so a server left
+/// its whole context pool behind on shutdown.
+pub fn deinit(self: *Self) void {
+    // Form parameter values are owned strings, so they go before the map.
     var itr = self.form_params.iterator();
     while (itr.next()) |e| {
         self.arena.free(e.value_ptr.*);
     }
     self.form_params.deinit();
+    self.arena.destroy(self.form_params);
+
+    self.cookies.deinit();
+    self.arena.destroy(self.cookies);
+
     self.parser.deinit();
     self.arena.destroy(self.parser);
 
-    // Free headers
-    // self.headers.deinit();
+    self.request_arena.deinit();
+    self.arena.destroy(self.request_arena);
 
-    // Free headers
-    // self.setValues.deinit();
+    self.arena.free(self.req_cookies);
+    self.arena.free(self.query_params);
+    self.arena.free(self.params);
+}
 
-    // Free payload if it was dynamically allocated (assuming it may be heap-allocated)
-    // if (self.payload.len > 0) {
-    //     self.arena.free(self.payload);
-    // }
+/// Returns the allocator whose memory is reclaimed at the end of this
+/// request. Use it for anything a handler produces; `arena` lives for the
+/// life of the process.
+pub fn requestAllocator(self: *Self) std.mem.Allocator {
+    return self.request_arena.allocator();
 }
 
 pub fn clear(self: *Self) void {
+    // Reclaims everything the last request allocated. Capacity is retained,
+    // so a steady request rate does no allocator work here.
+    _ = self.request_arena.reset(.retain_capacity);
+
     var itr = self.form_params.iterator();
     while (itr.next()) |e| {
         self.arena.free(e.value_ptr.*);
@@ -857,81 +877,6 @@ fn fastJson(comptime T: type, data: T, writer: *String) !void {
 //     }
 // }
 
-pub fn parseJson(comptime T: type, result: *T, input: []const u8) !void {
-    const fields = @typeInfo(T).@"struct".fields;
-    inline for (fields) |field| {
-        const key = std.fmt.comptimePrint("\"{s}\":", .{field.name});
-        const is_optional = @typeInfo(field.type) == .optional;
-        const pos_op = findKeyPos(input, key);
-        if (pos_op) |pos| {
-            const value_start = findValueStart(input[pos + key.len ..]) orelse return error.InvalidFormat;
-            const field_value_optional = @field(result, field.name);
-            const field_type: type = getUnderlyingType(@TypeOf(field_value_optional));
-            if (!is_optional or (is_optional and field_value_optional != null)) {
-                switch (field_type) {
-                    [][]const u8, []const []const u8 => {
-                        // var allocator = std.heap.c_allocator;
-                        // var arr = try std.heap.c_allocator.alloc([]const u8, 2);
-                        // _ = try parseStrArr(
-                        //     input[pos + key.len + value_start ..],
-                        //     field_type,
-                        //     &allocator,
-                        // );
-                        // const value = parseStringArray(
-                        //     input[pos + key.len + value_start ..],
-                        //     field_type,
-                        // );
-                        const arr = try parseArr(field_type, input[pos + key.len + value_start ..]);
-                        // print("{any}\n", .{value.len});
-                        // for (0..value.len) |i| {
-                        //     arr[i] = value[i];
-                        // }
-                        @field(result, field.name) = arr;
-                    },
-                    bool => {
-                        if (input[pos + key.len + value_start] == 't') {
-                            @field(result, field.name) = true;
-                        } else {
-                            @field(result, field.name) = false;
-                        }
-                    },
-                    []const u8 => {
-                        const value = parseString(input[pos + key.len + value_start ..]);
-                        @field(result, field.name) = value;
-                    },
-                    i32, f32 => {
-                        // print("{s}\n", .{input[pos + key.len + value_start ..]});
-                        const num_str = parseInt(input[pos + key.len + value_start ..]);
-                        const value = try std.fmt.parseInt(
-                            field_type,
-                            num_str,
-                            10,
-                        );
-                        @field(result, field.name) = value;
-                    },
-                    else => {
-                        switch (@typeInfo(field_type)) {
-                            .@"struct" => {
-                                // var value = field_value_optional;
-                                const struct_value = try std.heap.c_allocator.create(field_type);
-                                const offset = pos + key.len + value_start;
-                                // print("{any} {any}\n", .{ field_type, field_value });
-                                try parseJson(field_type, struct_value, input[offset..]);
-                                @field(result, field.name) = struct_value.*;
-                            },
-                            else => {},
-                        }
-                    },
-                }
-            } else {
-                @field(result, field.name) = null;
-            }
-        } else if (is_optional) {
-            @field(result, field.name) = null;
-        }
-    }
-}
-
 fn findKeyPos(input: []const u8, comptime key: []const u8) ?usize {
     const key_len = key.len;
     if (key_len == 0) return null;
@@ -1000,26 +945,6 @@ fn findValueStart(input: []const u8) ?usize {
         }
     }
     return null;
-}
-
-fn parseInt(input: []const u8) []const u8 {
-    var end: usize = 0;
-    var in_escape = false;
-    const quote: u8 = '\'';
-
-    while (end < input.len) : (end += 1) {
-        if (input[end] == '\r') break;
-        if (input[end] == '\n') break;
-        if (input[end] == ' ') break;
-        if (input[end] == '\\') {
-            in_escape = true;
-            continue;
-        }
-        if (input[end] == quote and !in_escape) break;
-        in_escape = false;
-    }
-
-    return input[0..end];
 }
 
 // fn parseString(input: []const u8) []const u8 {
@@ -1145,74 +1070,6 @@ pub fn skipWhitespace(text: []const u8, start_idx: usize) ?usize {
     return text.len;
 }
 
-fn parseStrArr(input: []const u8, comptime T: type, allocator: *std.mem.Allocator) !T {
-    var buffer_arr = input[1..];
-    const count = countCommas(input) + 1;
-    var arr = try allocator.alloc([]const u8, count);
-
-    const start: usize = 0;
-    var end: usize = 0;
-
-    for (0..count) |i| {
-        if (skipWhitespace(buffer_arr, 0)) |first| {
-            buffer_arr = buffer_arr[first..];
-        }
-        // print("{s}\n:End\n", .{buffer_arr});
-        if (findIndex(buffer_arr, '\n')) |e_n| {
-            if (findIndex(buffer_arr, ',')) |e_c| {
-                end = e_c + 1;
-            } else {
-                end = e_n;
-            }
-
-            // end = e_c + 1;
-        } else if (findIndex(buffer_arr, ',')) |e_c| {
-            end = e_c + 2;
-        } else if (findIndex(buffer_arr, ']')) |e_c| {
-            end = e_c;
-        }
-
-        if (buffer_arr[end - 1] == ',') {
-            arr[i] = buffer_arr[start + 1 .. end - 2];
-        } else {
-            arr[i] = buffer_arr[start + 1 .. end - 1];
-        }
-        buffer_arr = buffer_arr[end..];
-    }
-    return arr;
-}
-
-fn parseStringArray(input: []const u8, comptime T: type) T {
-    // Maximum expected array elements (adjust based on your use case)
-    const MaxElements = 16;
-    var elements: [MaxElements][]const u8 = undefined;
-    var count: usize = 0;
-
-    var i: usize = 0;
-    if (input.len > 0 and input[i] == '[') i += 1;
-
-    while (i < input.len and count < MaxElements) : (i += 1) {
-        // Skip whitespace
-        // i += mem.indexOfNonePos(u8, input, i, " \t\n\r") orelse break;
-
-        if (input[i] == ' ') continue;
-        if (input[i] == ']') break;
-
-        // Parse string value directly from input
-        const str_start = i + 1; // Skip opening quote
-        const str_end = mem.indexOfPos(u8, input, str_start, "\"") orelse input.len;
-        elements[count] = input[str_start..str_end];
-        count += 1;
-
-        // Jump to next element
-        i = mem.indexOfPos(u8, input, str_end, ",") orelse input.len;
-        i += 1; // Skip comma
-    }
-
-    // Return slice of populated elements
-    return elements[0..count];
-}
-
 fn findIndex(haystack: []const u8, needle: u8) ?usize {
     const vec_len = 16;
     const Vec16 = @Vector(16, u8);
@@ -1268,57 +1125,6 @@ pub fn countChar(text: []const u8, needle: u8) usize {
     }
 
     return count;
-}
-
-fn parseValue(comptime T: type, input: []const u8) !T {
-    switch (T) {
-        [][]const u8, []const []const u8 => {
-            return parseArr(T, input);
-        },
-
-        []const u8 => {
-            return parseString(input);
-        },
-        []u8 => {
-            return parseSlice(input);
-        },
-        else => {
-            // Parsing ints
-            return try parseInt(T, input);
-        },
-    }
-}
-
-fn parseSlice(input: []const u8) []u8 {
-    const end: usize = input.len - 1;
-    var slice = try std.heap.c_allocator.alloc(u8, input.len - 2);
-    @memcpy(&slice, input[1..end]);
-    return slice;
-}
-
-fn parseString(input: []const u8) []const u8 {
-    var end: usize = 0;
-    var in_escape = false;
-    var quote: u8 = 0;
-
-    if (input[0] == '"') {
-        quote = '"';
-    } else {
-        quote = '\'';
-    }
-
-    end = 1;
-    while (end < input.len) : (end += 1) {
-        if (input[end] == '"') break;
-        if (input[end] == '\\') {
-            in_escape = true;
-            continue;
-        }
-        if (input[end] == quote and !in_escape) break;
-        in_escape = false;
-    }
-
-    return input[1..end];
 }
 
 fn getEndArr(text: []const u8) usize {
@@ -1383,47 +1189,6 @@ fn subArrCount(text: []const u8) usize {
         i += 16;
     }
     return 0;
-}
-
-fn parseArr(comptime T: type, input: []const u8) !T {
-    const ElemT = @typeInfo(T).pointer.child;
-    const count = subArrCount(input);
-    if (count > 0) {}
-    const end_bracket = getEndArr(input);
-    var buffer_input = input[1..end_bracket];
-
-    const commas = countChar(buffer_input, ',') + 1;
-    var arr = try std.heap.c_allocator.alloc(ElemT, commas);
-
-    const start: usize = 0;
-    var end: usize = 0;
-    for (0..commas) |i| {
-        if (skipWhitespace(buffer_input, 0)) |first| {
-            buffer_input = buffer_input[first..];
-        }
-        if (findIndex(buffer_input, '\n')) |e_n| {
-            if (findIndex(buffer_input, ',')) |e_c| {
-                end = e_c + 1;
-            } else {
-                end = e_n;
-            }
-
-            // end = e_c + 1;
-        } else if (findIndex(buffer_input, ',')) |e_c| {
-            end = e_c + 2;
-        } else if (findIndex(buffer_input, ']')) |e_c| {
-            end = e_c;
-        }
-
-        if (buffer_input.len < 1) return arr;
-        if (buffer_input[end - 1] == ',') {
-            arr[i] = try parseValue(ElemT, buffer_input[start .. end - 1]);
-        } else {
-            arr[i] = try parseValue(ElemT, buffer_input[start..end]);
-        }
-        buffer_input = buffer_input[end..];
-    }
-    return arr;
 }
 
 pub fn stringifyArray(comptime T: type, data: T, writer: *String) !void {
@@ -1937,7 +1702,7 @@ pub fn bind(self: *Self, comptime T: type, value: *T) !void {
     // print("{s}\n", .{self.payload[0..self.content_length]});
     var parsed = std.json.parseFromSlice(
         T,
-        self.arena,
+        self.requestAllocator(),
         self.payload[0..self.content_length],
         .{ .ignore_unknown_fields = true },
     ) catch return error.MalformedJson;
@@ -1946,10 +1711,7 @@ pub fn bind(self: *Self, comptime T: type, value: *T) !void {
     inline for (fields) |f| {
         if (f.type == []const u8) {
             const field_value = @field(parsed.value, f.name);
-            // `self.arena`, matching `glue` below. This used to be
-            // `std.heap.c_allocator`, which forced a libc dependency and
-            // allocated outside the request's arena, so it was never freed.
-            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.arena);
+            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.requestAllocator());
         }
     }
     value.* = parsed.value;
@@ -1959,7 +1721,7 @@ pub fn glue(self: *Self, comptime T: type) !T {
     const fields = @typeInfo(T).@"struct".fields;
     var parsed = try std.json.parseFromSlice(
         T,
-        self.arena,
+        self.requestAllocator(),
         self.payload[0..self.content_length],
         .{ .ignore_unknown_fields = true },
     );
@@ -1968,7 +1730,7 @@ pub fn glue(self: *Self, comptime T: type) !T {
     inline for (fields) |f| {
         if (f.type == []const u8) {
             const field_value = @field(parsed.value, f.name);
-            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.arena);
+            @field(parsed.value, f.name) = try helpers.convertStringToSlice(field_value, self.requestAllocator());
         }
     }
     return parsed.value;
@@ -1983,14 +1745,126 @@ pub fn gluev2(self: *Self, comptime T: type, data: *T) !void {
         print("Failed to parse parser\n", .{});
         return err;
     };
-    self.parser.element().get_alloc(self.arena, data) catch |err| {
+    self.parser.element().get_alloc(self.requestAllocator(), data) catch |err| {
         print("Failed to alloc\n", .{});
         return err;
     };
+}
 
-    // try parseJson(
-    //     T,
-    //     data,
-    //     self.payload[0..self.content_length],
-    // );
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const TrackingAllocator = @import("TrackingAllocator.zig");
+
+/// A Context wired up enough to exercise the JSON binding helpers, without
+/// a socket or an event loop.
+fn testContext(arena: std.mem.Allocator) !Self {
+    return Self.init(
+        arena,
+        "POST",
+        "/",
+        null,
+        null,
+        helpers.ContentType.JSON,
+        null,
+        20,
+    );
+}
+
+const BindTarget = struct {
+    name: []const u8,
+    count: i64,
+};
+
+test "bind deserialises a JSON json_body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = try testContext(arena.allocator());
+    const json_body = "{\"name\":\"reverb\",\"count\":7}";
+    ctx.payload = json_body;
+    ctx.content_length = json_body.len;
+
+    var out: BindTarget = undefined;
+    try ctx.bind(BindTarget, &out);
+
+    try testing.expectEqualStrings("reverb", out.name);
+    try testing.expectEqual(@as(i64, 7), out.count);
+}
+
+test "glue returns the deserialised value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = try testContext(arena.allocator());
+    const json_body = "{\"name\":\"glue\",\"count\":1}";
+    ctx.payload = json_body;
+    ctx.content_length = json_body.len;
+
+    const out = try ctx.glue(BindTarget);
+    try testing.expectEqualStrings("glue", out.name);
+    try testing.expectEqual(@as(i64, 1), out.count);
+}
+
+test "bind rejects malformed JSON" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = try testContext(arena.allocator());
+
+    for ([_][]const u8{ "", "{", "not json", "{\"name\":}", "[]" }) |json_body| {
+        ctx.payload = json_body;
+        ctx.content_length = json_body.len;
+        var out: BindTarget = undefined;
+        try testing.expectError(error.MalformedJson, ctx.bind(BindTarget, &out));
+    }
+}
+
+// Contexts are pooled for the life of the process and their allocator is the
+// server's arena, which nothing resets, so anything bind allocates is held
+// until shutdown: a request-rate leak rather than a one-off.
+//
+// The allocator is handed to the Context directly, with no ArenaAllocator in
+// between. An arena serves small allocations out of chunks it already holds,
+// so measuring its backing allocator hides exactly the growth this looks for.
+test "repeated binds do not grow memory without bound" {
+    var ta: TrackingAllocator = undefined;
+    const tracked = ta.init(testing.allocator);
+    defer ta.deinit();
+
+    var ctx = try testContext(tracked);
+    defer ctx.deinit();
+    const json_body = "{\"name\":\"reverb\",\"count\":7}";
+
+    // Warm up, so one-time setup is not counted as growth.
+    for (0..16) |_| {
+        ctx.payload = json_body;
+        ctx.content_length = json_body.len;
+        var out: BindTarget = undefined;
+        try ctx.bind(BindTarget, &out);
+        ctx.clear();
+    }
+    const after_warmup = ta.bytesAllocated();
+
+    const iterations: usize = 256;
+    for (0..iterations) |_| {
+        ctx.payload = json_body;
+        ctx.content_length = json_body.len;
+        var out: BindTarget = undefined;
+        try ctx.bind(BindTarget, &out);
+        ctx.clear();
+    }
+    const growth = ta.bytesAllocated() -| after_warmup;
+
+    // Per-request retention shows up as growth proportional to the request
+    // count; a bounded implementation stays flat.
+    testing.expect(growth < iterations) catch {
+        std.debug.print(
+            "bind retained {d} bytes across {d} calls ({d} per call)\n",
+            .{ growth, iterations, growth / iterations },
+        );
+        return error.BindRetainsMemoryPerRequest;
+    };
 }
