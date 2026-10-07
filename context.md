@@ -30,9 +30,9 @@ See `README.md` for the public API.
 ## 2. Current state (verified 2026-10-07)
 
 ```
-16,267 lines of Zig across 46 files (after the package splits)
-      61 test blocks, all of which run
-      58 tests pass (38 unit, 20 integration)
+16,528 lines of Zig across 46 files (after the package splits)
+      83 test blocks, all of which run
+      80 tests pass (48 unit, 32 integration)
 ```
 
 - `zig build` succeeds. `zig build test` passes. `zig fmt --check` clean.
@@ -44,7 +44,7 @@ See `README.md` for the public API.
 - Graceful shutdown works: serves a request, exits 0 on SIGTERM, in both
   Debug and ReleaseSafe.
 - **Linux verified by execution**, not just compilation: both suites run
-  under `x86_64-linux-musl` in Docker (44 unit, 20 integration), so the
+  under `x86_64-linux-musl` in Docker (48 unit, 32 integration), so the
   epoll backend is genuinely exercised. All five cross-compile targets
   build both the exe and the test binaries.
 - **No libc dependency.** Builds and tests clean without `link_libc` on
@@ -87,23 +87,19 @@ it exits 127 and looks like a pass.
 
 ## 4. Remaining work
 
-1. **Keep-alive response headers.** Responses do not set
-   `Connection: keep-alive` or advertise anything about connection reuse;
-   clients rely on HTTP/1.1 defaults. Worth auditing now that pipelining
-   works.
-2. **Four `std.heap.c_allocator` references remain**, all in
-   `context.zig`'s JSON-binding path (`parseJson`, `parseSlice`,
-   `parseArr`). They do not force a libc dependency today because those
-   functions are never analysed — and they cannot be, since `parseSlice`
-   uses `try` in a function whose return type is not an error union and
-   `@memcpy`s through a `*[]u8`. Fixing that path means repairing those
-   errors, not just swapping the allocator, so it was left alone.
+1. **`Cluster` for multi-worker throughput.** Loom measured 5.16× at 8
+   workers. The handler is per-worker, so a `*Reverb` shared across workers
+   needs a thread-safety audit first: `arena`, `routes`, `logger`,
+   `end_points` and the context pool are all shared today, and
+   `Server.use_cors`, `signal_target` and `cors_header_buffer` are statics.
+   This is the one remaining item that changes concurrency assumptions.
 
-3. **Chunked transfer-encoding is still not implemented**, but it is now
-   refused rather than mis-framed: a request carrying a `Transfer-Encoding`
-   other than `identity`, or carrying both `Transfer-Encoding` and
-   `Content-Length`, gets a 411. Implementing it properly is open.
-4. **Several files are reachable from nothing** — kept deliberately, they
+2. **The websocket layer and Treehouse have no tests.** `src/lib/wss.zig`
+   and `src/lib/treehouse.zig` are the last substantial pieces inside
+   reverb that nothing exercises. Treehouse needs a running cache server on
+   port 6401, which is why its one test was removed rather than fixed.
+
+3. **Several files are reachable from nothing** — kept deliberately, they
    are wanted later: `src/lib/core/Url.zig`, `src/lib/core/Providers.zig`,
    `src/error_index.zig`, `src/assembler/`, `src/execute/`, `src/errors/`,
    `src/sample/sample.zig`.
@@ -111,24 +107,29 @@ it exits 127 and looks like a pass.
    Five still `@import("pg")` or `@import("pg_orm")`: `error_index.zig`,
    `assembler/crud.zig`, `execute/{handlers,queries}.zig` and
    `errors/store.zig`. That compiles only because nothing reaches them.
-   Wiring any of them up means taking `pg-orm` as a dependency.
+   Wiring any up means taking `pg-orm` as a dependency. Two also call
+   `ctx.bind` / `ctx.glue`, which now exist and are tested.
 
-5. **The websocket layer and Treehouse have no tests.** `src/lib/wss.zig`
-   and `src/lib/treehouse.zig` are the last substantial pieces inside
-   reverb that nothing exercises. Treehouse also needs a running cache
-   server on port 6401, which is why its one test was removed rather than
-   fixed.
+4. **`src/lib/core/simdjson/` (7,551 lines) is vendored.** Left as-is by
+   decision. If it is a copy of simdjzon it should eventually be a
+   dependency. Note `gluev2` is the only live consumer.
 
-6. **`Cluster` for multi-worker throughput.** Loom measured 5.16× at 8
-   workers. Do this last: the handler is per-worker, so `*Reverb` shared
-   across workers needs a thread-safety audit — `arena`, `routes`,
-   `logger`, `end_points` and the context pool are all shared today, and
-   `Server.use_cors` / `signal_target` are statics.
-7. **`src/lib/core/simdjson/` (7,551 lines) is vendored.** Left as-is by
-   decision. Its two test files were deleted here as dead. If it is a
-   copy of simdjzon it should eventually be a dependency.
+5. **Request-scoped allocation is opt-in.** `Context.requestAllocator()`
+   exists and the binding helpers use it, but handlers that reach for
+   `ctx.arena` still allocate for the life of the process. Worth auditing
+   the remaining `self.arena` uses in `context.zig` to see which should be
+   request-scoped.
 
----
+### Done since the first pass
+
+- Chunked transfer-encoding is implemented: framed, decoded in place, with
+  the size limit applied to the decoded length.
+- `Connection: close` is honoured, every response reports its connection
+  handling consistently, and a 404 no longer tears down the connection.
+- `auth`, `payment`, `claude` and the `pg` ORM are separate packages (§5).
+- The hand-rolled JSON parser in `context.zig` is gone, and JSON binding no
+  longer leaks per request.
+- No `libc` dependency, and no `std.heap.c_allocator` references remain.
 
 ## 5. What moved out of reverb
 
@@ -171,11 +172,12 @@ reverb is public or CI has a token.
 
 ---
 
-## 6. Dead code removed on this branch
+## 6. Dead code removed
 
 Ten files, ~6,100 lines, unreachable from every build root. Eight were
 untracked, so commit `dbb7235` snapshots them before `98713bb` deletes
-them — recover with `git show dbb7235:<path>`.
+them — recover with `git show dbb7235:<path>`. Both commits are on `main`,
+so the snapshot survives independently of any branch.
 
 `context_old.zig` and `server_1.zig` were stale duplicates of
 `context.zig` and `server.zig`; `src/lib/Websocket.zig` and
