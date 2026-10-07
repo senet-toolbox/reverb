@@ -3,7 +3,7 @@
 An HTTP server for Zig, built on [Loom](https://github.com/tether-labs/Loom).
 
 Loom is a bare TCP event loop. Reverb is everything above it: request
-framing, parsing, routing, context, sessions, auth, websockets.
+framing, parsing, routing, context, cookies, websockets.
 
 ```zig
 const std = @import("std");
@@ -119,7 +119,7 @@ kernel-assigned port — use `bindListener()` and `boundPort()`.
 
 ```sh
 zig build test              # everything
-zig build test-unit         # parsers, routing, JWT, allocators
+zig build test-unit         # parsers, routing, allocators
 zig build test-integration  # a real server over real sockets
 ```
 
@@ -134,12 +134,22 @@ a `zig fmt` check and a smoke test that serves a request and shuts down on
 
 ## Status
 
-Pre-1.0 and the API moves. What is covered by tests is listed above; the
-auth, payment and websocket modules under `src/lib/` are not, and should
-be treated as less settled than the HTTP core.
+Pre-1.0 and the API moves. What is covered by tests is listed above. The
+websocket layer (`src/lib/wss.zig`) and the Treehouse cache client are
+not, and should be treated as less settled than the HTTP core.
 
-The Postgres ORM that used to live here is now its own package — an HTTP
-server has no business carrying a database layer.
+Reverb's scope is the HTTP layer. Everything that was not that now lives
+in its own package:
+
+| Package | What moved |
+| --- | --- |
+| [reverb-auth](https://github.com/senet-toolbox/reverb-auth) | OAuth (Google, GitHub), sessions, JWT |
+| [pg-orm](https://github.com/senet-toolbox/pg-orm) | the Postgres query builder and ORM |
+| [stripe-zig](https://github.com/senet-toolbox/stripe-zig) | the Stripe client |
+| [claude-zig](https://github.com/senet-toolbox/claude-zig) | the Claude and Vertex AI clients |
+
+Note that `reverb.JWT` and `reverb.KeyStone` are gone; they are
+`reverb_auth.JWT` and `reverb_auth.KeyStone` now.
 
 ## License
 
