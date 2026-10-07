@@ -72,6 +72,9 @@ form_params: *std.StringHashMap([]const u8) = undefined, // Array of key-value p
 method: []const u8,
 route: []const u8,
 content_length: usize = 0,
+/// Set when the request asked for the connection to be closed after the
+/// response. `Server.handle` acts on this once the response has drained.
+close_requested: bool = false,
 http_payload: []const u8,
 content_type: helpers.ContentType = helpers.ContentType.None,
 client: ?*Client = null,
@@ -163,6 +166,7 @@ pub fn clear(self: *Self) void {
     self.req_query_params_index = 0;
     self.req_cookie_index = 0;
     self.content_length = 0;
+    self.close_requested = false;
     // Both of these must be cleared: contexts are pooled and reused per
     // connection slot, so a stale payload would otherwise be visible to the
     // next request that happens not to carry a body.
@@ -292,6 +296,15 @@ fn buildStandardHeaders(
     var end: usize = 0;
 
     try self.headerAppend(&end, status_line);
+
+    // Emitted here rather than baked into each status line, so every
+    // response -- success, error, preflight, file -- reports the same
+    // connection handling the server actually performs.
+    try self.headerAppend(&end, if (self.close_requested)
+        "Connection: close\r\n"
+    else
+        "Connection: keep-alive\r\n");
+
     try self.headerAppend(&end, "Content-Type: ");
     try self.headerAppend(&end, content_type);
     try self.headerAppend(&end, "\r\n");
@@ -337,9 +350,12 @@ fn buildStandardHeaders(
 
 pub fn ERROR(self: *Self, status_code: u16, payload: []const u8) !void {
     var status_line_buf: [128]u8 = undefined;
+    // An error status is not by itself a reason to drop the connection: a
+    // 404 answers a perfectly well-formed request. The Connection header
+    // comes from `buildStandardHeaders` like every other response.
     const status_line = try std.fmt.bufPrint(
         &status_line_buf,
-        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\nConnection: close\r\n",
+        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\n",
         .{ status_code, statusReason(status_code) },
     );
 
@@ -681,8 +697,7 @@ pub fn STRING(self: *Self, payload: []const u8) !void {
 pub fn OPTIONS(self: *Self) !void {
     const status_line =
         "HTTP/1.1 200 OK\r\n" ++
-        "Vary: Accept-Encoding, Origin\r\n" ++
-        "Connection: Keep-Alive\r\n";
+        "Vary: Accept-Encoding, Origin\r\n";
 
     const end = try self.buildStandardHeaders(
         status_line,

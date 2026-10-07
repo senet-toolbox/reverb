@@ -208,6 +208,33 @@ pub const Connection = struct {
         return buf.toOwnedSlice(allocator);
     }
 
+    /// True if the peer closed its side within `millis`.
+    ///
+    /// Distinguishes a server that honours `Connection: close` from one
+    /// that leaves the connection open for the idle timeout to reap.
+    pub fn peerClosed(c: *const Connection, millis: i64) !bool {
+        try c.setTimeouts(millis);
+        defer c.setTimeouts(2000) catch {};
+
+        var chunk: [1024]u8 = undefined;
+        while (true) {
+            const rc = system.read(c.fd, &chunk, chunk.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    // 0 bytes means EOF: the peer closed.
+                    if (rc == 0) return true;
+                    // More response data; keep draining.
+                    continue;
+                },
+                .INTR => continue,
+                // Timed out with the connection still open.
+                .AGAIN => return false,
+                .CONNRESET, .PIPE => return true,
+                else => return error.RecvFailed,
+            }
+        }
+    }
+
     pub fn setTimeouts(c: Connection, millis: i64) !void {
         const tv = std.c.timeval{
             .sec = @intCast(@divTrunc(millis, 1000)),

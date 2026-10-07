@@ -333,6 +333,25 @@ fn hasContentLength(headers: []const u8) bool {
     return false;
 }
 
+/// True when the request asks for the connection to be closed once the
+/// response is sent.
+///
+/// `Connection: close` on an HTTP/1.1 request, or the absence of
+/// `Connection: keep-alive` on anything older, since keep-alive only became
+/// the default in 1.1.
+pub fn wantsConnectionClose(request_line: []const u8, connection: []const u8) bool {
+    var tokens = std.mem.splitScalar(u8, connection, ',');
+    while (tokens.next()) |token| {
+        const value = std.mem.trim(u8, token, " \t");
+        if (std.ascii.eqlIgnoreCase(value, "close")) return true;
+        if (std.ascii.eqlIgnoreCase(value, "keep-alive")) return false;
+    }
+
+    // No opinion stated: 1.1 and later keep the connection, older versions
+    // close it.
+    return std.mem.indexOf(u8, request_line, "HTTP/1.1") == null;
+}
+
 /// True when the head declares `Transfer-Encoding: chunked`.
 ///
 /// Only meaningful on a head that `expectedHttpRequestLength` has already

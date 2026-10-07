@@ -1105,9 +1105,28 @@ pub fn Server(comptime Config: type) type {
                 ctx.clear();
                 ctx.client = client;
                 try serveRequest(reverb, client, ctx, recv_buf[0..request_len], body_len);
+
+                // A client that asked to close gets closed, and anything it
+                // pipelined behind that request is discarded -- it told us it
+                // was done.
+                if (ctx.close_requested) {
+                    reverb.closeWhenDrained(client);
+                    request_buffer.reset(reverb.arena);
+                    return;
+                }
             }
 
             return;
+        }
+
+        /// Closes the connection once its response has finished sending.
+        ///
+        /// Closing while a write is still draining would truncate the
+        /// response, so a connection with bytes still in flight is left to
+        /// loom's idle timeout instead.
+        fn closeWhenDrained(reverb: *Reverb, client: *Client) void {
+            if (client.isWriting()) return;
+            reverb.loom.closeClient(client);
         }
 
         /// Writes the status that corresponds to a framing failure.
@@ -1180,6 +1199,11 @@ pub fn Server(comptime Config: type) type {
                 };
                 return;
             }
+
+            ctx.close_requested = helpers.wantsConnectionClose(
+                http_header.request_line,
+                http_header.connection,
+            );
 
             const body_len = decoded_body_len orelse http_header.content_length;
             if (body_len > 0) {
@@ -1255,7 +1279,11 @@ pub fn Server(comptime Config: type) type {
                 ctx.ERROR(404, "") catch |write_err| {
                     return write_err;
                 };
-                return error.BrokenPipe;
+                // Deliberately not an error: loom closes the connection when
+                // `process` fails, and a missing route is an ordinary
+                // response to a well-formed request. Returning one here made
+                // every 404 cost the client its connection.
+                return;
             };
         }
     };
