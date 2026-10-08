@@ -787,6 +787,13 @@ pub fn Server(comptime Config: type) type {
                 Metrics.active_end_points = null;
             }
 
+            // Contexts are pooled one per connection slot and allocate
+            // buffers at startup; nothing used to release them.
+            for (self.context_slots) |ctx| {
+                ctx.deinit();
+            }
+            self.arena.free(self.context_slots);
+
             for (&self.routes) |*radix| {
                 radix.deinit();
             }
