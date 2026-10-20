@@ -215,3 +215,137 @@ docker run --rm --platform linux/amd64 -v /tmp:/w -w /w alpine:3 ./t
 
 Loom, for reference: `cd ../loom && zig build test` (49 tests), and its
 `TESTING.md` documents the injection matrix and known gaps.
+
+---
+
+## 8. Next: replying later (deferred responses)
+
+Written 2026-10-20. Loom's half (posting back to the loop, client
+generations, pausing reads, the awaiting timeout) is in
+`../loom/context.md`; do that first.
+
+### Why
+
+Handlers run on the loop thread and the loop waits for them
+(`Server.handle` → `serveRequest` → `callRoute`). assembler-backend runs
+`zig build` (~5 s) and Claude API calls (seconds to minutes) in handlers,
+and during either the server answers nothing else. Non-blocking sockets do
+not help when the handler itself blocks. `Cluster` (§4.1) would only
+divide the stall, not remove it.
+
+### The API
+
+```zig
+// Handler, on the loop thread.
+fn build(ctx: *Context) !void {
+    const source = try gpa.dupe(u8, ctx.body());   // the job owns its input
+    const reply = try ctx.deferReply();            // last fallible step
+    builds.submit(.{ .reply = reply, .source = source }) catch {
+        gpa.free(source);
+        reply.send(503, "text/plain", "busy");
+    };
+}
+
+// Worker thread.
+fn runBuild(job: Job) void {
+    defer gpa.free(job.source);
+    const wasm_id = ...;
+    job.reply.send(200, "text/plain", wasm_id);    // threadsafe, exactly once
+}
+
+var builds: reverb.Workers(Job, runBuild) = undefined;
+try builds.init(gpa, io, .{ .threads = 2, .queue = 16 });
+defer builds.deinit();                             // closes the queue, joins
+```
+
+### `ctx.deferReply() !*Reply`
+
+Captures, from the context, everything the response will need, because the
+context is pooled per slot and cleared when the handler returns
+(`defer ctx.clear()` in `handle`):
+
+- `slot`, the client's `generation`, and the `*Loom` that owns it.
+- `close_requested`, the echoed `Access-Control-Allow-Headers`
+  (`http_header.accept_control_request_headers`, request memory), and any
+  cookies the handler set.
+- A Loom `Task` node for posting back.
+
+It marks the context deferred and the client awaiting, and pauses reads
+(Loom §2.3, §2.4). It allocates from a threadsafe allocator
+(`std.heap.smp_allocator` or the server's gpa); never from `ctx.arena` or
+the request arena.
+
+### `reply.send(status, content_type, body)`
+
+Callable once, from any thread. It copies `body` and posts the reply to its
+loop. Everything else happens on the loop thread, in the task:
+
+1. `loom.clientAt(slot, generation)`; if null, the client is gone: free
+   and return.
+2. Build the head and write. **Build it here, not in `send`:** `httpDate()`
+   writes into the global `cached_date` (`context.zig:578`), so formatting
+   headers on a worker thread races the loop. The CORS block
+   (`Context.cors_headers`) is read-only after `prepare`, so it is fine.
+3. Clear awaiting, resume reads, honour `close_requested` the same way
+   `handle` does (`closeWhenDrained`).
+4. Serve any pipelined requests that were buffered behind this one: factor
+   the `while (true)` loop in `handle` into `serveBuffered(slot)` and call
+   it here. Stop again if one of those defers too.
+5. Free the reply.
+
+`send` should not take a Context-shaped API (`STRING`, `JSON`, `FILE`):
+those write through the client directly. Extract the header building in
+`buildStandardHeaders` into a function over plain parameters, used by both
+`Context` and `Reply`, so the two cannot drift.
+
+### Changes in `Server.handle` / `serveRequest`
+
+- After `serveRequest`, if the context deferred, stop the pipelining loop
+  and leave the remaining bytes in the request buffer.
+- A handler that returns an error after `deferReply` must not get the
+  automatic `ERROR(404, "")`: that would answer twice. Log the error and
+  leave the response to the reply. (Separately, mapping every handler error
+  to 404 is questionable; 500 is the honest status.)
+- `deinit` order: stop the loop, `deinit` the worker pools (they finish
+  their current job and `send`), then let Loom run or free the posted
+  tasks, then free the context pool.
+
+### `reverb.Workers(Job, run)`
+
+A fixed set of `std.Thread`s reading a `std.Io.Queue(Job)`:
+
+- `submit` is a non-blocking put (`put(io, &.{job}, 0)`); a full queue is
+  `error.Busy`, so the handler can answer 503 instead of queueing without
+  bound.
+- `deinit` closes the queue; workers drain what is queued, see
+  `error.Closed` and exit; then join.
+- Separate pools per kind of work, so slow work cannot starve other work:
+  in assembler-backend, builds (CPU-bound; `zig build` is already
+  parallel, so 1 to 2 threads) and chat (waiting on the network, 8 or
+  more).
+- Plain threads and a mutex-guarded queue, not lock-free: see
+  `../loom/context.md` §3.
+
+### Tests (`tests/integration.zig`, each proven to fail)
+
+| Test | Bug it catches |
+| --- | --- |
+| A deferred route whose worker sleeps 1 s; `GET /` on another connection answers in < 100 ms | work still on the loop thread |
+| A deferred response's status, body and headers (CORS, `Connection`, `Content-Length`) match the same response sent directly | the two header paths drifting; captured state lost |
+| Keep-alive: a second request on the connection after a deferred reply | reads never resumed |
+| A deferred request and a fast one pipelined in one write come back in order | serving buffered requests before the reply |
+| Client hangs up before the reply; a new connection on the same slot does not get the old body | no generation check |
+| Queue full answers 503 at once | blocking submit |
+| `Connection: close` honoured after a deferred reply | `close_requested` not captured |
+| A handler error after `deferReply` produces exactly one response | the automatic 404 still sent |
+| `deinit` with jobs queued and in flight: threads joined, no leaks under `std.testing.allocator` | shutdown order |
+| Many concurrent deferred requests from several threads (`ReleaseSafe` too) | races in `send` or the post queue |
+
+### Then, in assembler-backend
+
+`POST /api/wasm/build`, `POST /chat` and `POST /api/vertex` become
+deferred, on a build pool and a chat pool. The build cap the plan asks for
+becomes the build pool's size. `WasmBuilder` already gives each build its
+own folder and the shared zig cache is safe for concurrent builds; its
+sweep only deletes entries older than an hour, longer than any build may
+run.
