@@ -20,20 +20,27 @@ a bare TCP event loop. The split matters and should be preserved:
   websockets, ORM.
 
 So "a request split across two packets" and "two pipelined requests in
-one packet" are Reverb's problem, handled in `readCompleteHttpRequest`
-(`src/lib/server.zig`) and now covered by integration tests.
+one packet" are Reverb's problem, handled in `Server.handle` and
+`serveBuffered` (`src/lib/server.zig`) and now covered by integration tests.
 
 See `README.md` for the public API.
 
 ---
 
-## 2. Current state (verified 2026-10-07)
+## 2. Current state (verified 2026-10-20)
 
 ```
-16,528 lines of Zig across 46 files (after the package splits)
-      83 test blocks, all of which run
-      80 tests pass (48 unit, 32 integration)
+18,763 lines of Zig across 54 files (src/, tests/, examples/)
+      96 test blocks, all of which run
+      93 tests pass (51 unit, 42 integration)
 ```
+
+- Deferred responses (§8) are in: `ctx.deferReply`, `reverb.Reply`,
+  `reverb.Workers`. Verified on macOS (kqueue) and on Linux (epoll, in
+  Docker), Debug and ReleaseSafe; all five cross-compile targets build
+  the exe and both test binaries.
+- Loom is pinned by URL and hash at `8d791ac` (its `main`), the commit
+  with Loom's half of this work.
 
 - `zig build` succeeds. `zig build test` passes. `zig fmt --check` clean.
 - No leaks: unit tests run under `std.testing.allocator`.
@@ -198,11 +205,11 @@ git history — confirmed.
 ```
 zig build                   # builds
 zig build run               # serves on :8080, SIGTERM to stop
-zig build test              # 52 tests
+zig build test              # 93 tests
 zig build test-unit
 zig build test-integration
-zig build check-readme      # compiles the README quickstart
-zig fmt --check src/ tests/ examples/readme_quickstart.zig build.zig
+zig build check-readme      # compiles the README examples
+zig fmt --check src/ tests/ examples/ build.zig
 ```
 
 Running the Linux side from macOS:
@@ -218,7 +225,11 @@ Loom, for reference: `cd ../loom && zig build test` (49 tests), and its
 
 ---
 
-## 8. Next: replying later (deferred responses)
+## 8. Replying later (deferred responses)
+
+**Done 2026-10-20** — see "What was built" at the end of this section.
+The design notes below are kept as written. Next is assembler-backend
+(last subsection).
 
 Written 2026-10-20. Loom's half (posting back to the loop, client
 generations, pausing reads, the awaiting timeout) is in
@@ -349,3 +360,73 @@ becomes the build pool's size. `WasmBuilder` already gives each build its
 own folder and the shared zig cache is safe for concurrent builds; its
 sweep only deletes entries older than an hour, longer than any build may
 run.
+
+### What was built (2026-10-20)
+
+By the names above, with these differences and additions:
+
+- `src/lib/Reply.zig` (`reverb.Reply`) and `src/lib/Workers.zig`
+  (`reverb.Workers`). `send` copies into one allocation laid out as
+  content type, head room, body, so the loop builds the head in front of
+  the body and sends the whole response with a single `write`. A second
+  `send` trips an assert; an allocation failure in `send` still posts,
+  and the loop closes the connection instead of leaving it to the reply
+  timeout.
+- Header building is `Context.writeHead(buf, Head)` over plain values,
+  used by both `Context.buildStandardHeaders` and `Reply.render`. Cookies
+  render through `Context.renderCookies` into caller memory, which also
+  fixes a leak: `generateCookieString` built every `Set-Cookie` block in
+  the process arena and never freed it.
+- `ctx.SEND(status, content_type, body)`: the in-handler counterpart of
+  `reply.send`, same signature. The header-equality test compares the two.
+- The context reaches its server through `Context.defer_hook`, set once
+  per pooled context in `Server.new`, so `Context` stays non-generic.
+- `Server.reply_allocator` (default `std.heap.smp_allocator`) is where
+  replies live; the test harness sets it to `std.testing.allocator`.
+  `Config.reply_timeout_ms` is optional, passed through to Loom.
+- `handle` is now: append, then `serveBuffered(client)`. The websocket
+  branch moved to `handleWebSocket` so `handle`'s frame no longer holds a
+  `MAX_RECV_SIZE` stack buffer while `serveBuffered` holds another.
+- **`RequestBuffer` identity is `client.generation`, not the socket.** The
+  kernel hands a closed descriptor's number to the next accept, so a new
+  connection in the same slot could inherit the old one's unserved bytes.
+  That was a latent bug before this work, and a sure one with deferral (the
+  bytes behind a deferred request sit buffered). Covered by the slot test.
+- Handler errors answer **500**; only a missing route or method answers
+  404. After `deferReply`, a handler error is logged and nothing is sent.
+- `Server.deinit` now calls `loom.deinit()` first, so posted replies run
+  (and free themselves) while everything they could touch still exists.
+- README "Replying later" section; the example in it is a real file,
+  `examples/replying_later.zig`, compiled by `zig build check-readme`.
+
+Injection results (`tests/defer_test.zig`, each run with the bug in):
+
+| Test | Injected bug | Result |
+| --- | --- | --- |
+| other connections not held up | `submit` runs the job inline | fails |
+| deferred == direct response | reply drops echoed `Allow-Headers` / drops cookies | fails / fails |
+| keep-alive after deferred reply | no `resumeReads` | fails |
+| pipelined in order | no `if (ctx.deferred) return` / no `serveBuffered` after reply | fails / fails |
+| closed connection, same slot | lookup by slot only / request buffer keyed by socket | fails / fails |
+| full queue 503 at once | blocking put (`min = 1`) | fails |
+| `Connection: close` after reply | `close_requested` not captured | fails |
+| handler error after defer | automatic error response kept | fails (2 responses) |
+| shutdown with jobs queued | pool drops queued jobs / reply not freed when client gone | fails (leak) / fails (leak) |
+| many concurrent | `send` posts before copying the body | **passes** as is; fails (segfault) with a 200 µs sleep widening the window |
+
+Known gaps, not fixed:
+
+- The concurrency test does not catch a post-before-copy race at its
+  natural width, nor a non-threadsafe `reply_allocator` (tried with the
+  server arena: passed). Both are races whose window is a few
+  instructions wide.
+- A client that hangs up while awaiting is not noticed until the reply is
+  written or `reply_timeout_ms` passes: reads are paused, so no EOF event
+  arrives. The slot stays taken meanwhile.
+- If an earlier response on the same connection is still draining when a
+  reply arrives, `write` fails with `WriteInProgress` and the connection is
+  closed. Direct pipelined responses already behaved this way; it needs a
+  write queue in Loom (or "run when drained") to fix properly.
+- `closeWhenDrained` leaves a still-writing connection to the idle
+  timeout (unchanged; applies to deferred replies the same way).
+

@@ -41,8 +41,8 @@
         // checkout. To develop against a local Loom, swap this for
         // `.{ .path = "../loom" }` temporarily — don't commit that form.
         .loom = .{
-            .url = "git+https://github.com/tether-labs/Loom.git#58c08d8edf5bf659992faa5ce574b5ce655153f2",
-            .hash = "loom-0.0.0--12JvspkBACW0RwODMvKvhlAxpXGeg3giQ3Z28KmjTbL",
+            .url = "git+https://github.com/tether-labs/Loom.git#8d791ac22e094dd6e1851b200d9c44fd575fd421",
+            .hash = "loom-0.0.0--12JvnjhAwCXyoHKe0c7zG2IK0Su9oUNUHjnicFQ4kQN",
         },
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding

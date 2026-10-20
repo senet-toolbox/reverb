@@ -90,7 +90,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: zig fmt
-        run: zig fmt --check src/ tests/ examples/readme_quickstart.zig build.zig
+        run: zig fmt --check src/ tests/ examples/ build.zig
 
   # The server a reader starts first gets to stay working: serve a
   # request, then SIGTERM and require a clean exit. A server that ignores

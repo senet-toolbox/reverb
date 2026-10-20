@@ -62,7 +62,7 @@ connections. It applies **no framing**: a handler receives exactly what one
 
 **Reverb owns everything above that.** So "a request split across two
 packets" and "two pipelined requests in one packet" are Reverb's problem,
-handled in `readCompleteHttpRequest` (`src/lib/server.zig`) and covered by
+handled in `Server.handle` and `serveBuffered` (`src/lib/server.zig`) and covered by
 the integration tests.
 
 Two consequences worth knowing:
@@ -101,8 +101,81 @@ passed per route as the third argument.
 | `ctx.STRING(bytes)` | `text/plain` |
 | `ctx.JSON(T, value)` | `application/json` |
 | `ctx.FILE(file)` | streamed, content type by extension |
+| `ctx.SEND(code, content_type, body)` | the given status and content type |
 | `ctx.ERROR(code, body)` | the given status |
 | `ctx.RAW(bytes)` | written verbatim, headers included |
+
+A handler that returns an error gets a `500`; a route that does not exist,
+a `404`.
+
+## Replying later
+
+Handlers run on the event loop's thread, and the loop waits for them. A
+handler that waits on something slow -- a child process, an outbound API
+call -- stalls every other connection until it returns.
+
+Instead, hand the work to a worker thread and answer when it is done:
+
+```zig
+const Job = struct {
+    reply: *reverb.Reply,
+    source: []u8, // owned by the job
+};
+
+fn runBuild(job: Job) void {
+    defer gpa.free(job.source);
+    // The slow part: a child process, an outbound API call...
+    job.reply.send(200, "text/plain", "built");
+}
+
+var builds: reverb.Workers(Job, runBuild) = undefined;
+
+fn build(ctx: *Context) !void {
+    const source = try gpa.dupe(u8, ctx.body()); // the job owns its input
+    errdefer gpa.free(source);
+    const reply = try ctx.deferReply(); // last fallible step
+    builds.submit(.{ .reply = reply, .source = source }) catch {
+        gpa.free(source);
+        reply.send(503, "text/plain", "busy");
+    };
+}
+```
+
+```zig
+var server: reverb.Server(Config) = undefined;
+try server.new(.{}, arena.allocator());
+defer server.deinit(); // last: frees replies left without a connection
+
+var threaded: std.Io.Threaded = .init_single_threaded;
+try builds.init(gpa, threaded.io(), .{ .threads = 2, .queue = 16 });
+defer builds.deinit(); // after `listen` returns, before `server.deinit`
+```
+
+The whole program is `examples/replying_later.zig`, compiled by
+`zig build check-readme`.
+
+- **`ctx.deferReply()`** takes the response over from the handler. The
+  context is reused as soon as the handler returns, so copy whatever the
+  job needs first. Requests pipelined behind this one wait until it is
+  answered, and the connection is held for up to `reply_timeout_ms`
+  (a `Config` field, default five minutes) instead of the idle timeout.
+- **`reply.send(status, content_type, body)`** is threadsafe and must be
+  called exactly once, failure included. It copies its arguments. The
+  response it produces is the one `ctx.SEND` would have; CORS headers,
+  cookies set before deferring and `Connection: close` are all carried
+  over. A handler error after `deferReply` is logged, not answered.
+- **`reverb.Workers(Job, run)`** is a fixed set of threads reading a
+  bounded queue. `submit` never blocks: a full queue is `error.Busy`, so
+  the handler can answer 503. Use one pool per kind of work, so slow work
+  cannot starve other work.
+- Replies are allocated from `server.reply_allocator`, which must be
+  threadsafe (default `std.heap.smp_allocator`).
+
+If the client goes away first the reply is dropped, never sent to a later
+connection that reuses the slot.
+
+**Shutdown order:** `listen` returns, then `deinit` every pool (queued jobs
+still run and send), then `server.deinit()`.
 
 ## Shutdown
 
@@ -126,7 +199,8 @@ zig build test-integration  # a real server over real sockets
 The integration suite starts a server on an ephemeral port and drives it
 over real connections: requests split across packets, keep-alive reuse,
 oversized headers and bodies, malformed request lines, stalled
-connections, concurrent clients, clean shutdown. See `tests/harness.zig`.
+connections, concurrent clients, clean shutdown, and deferred replies
+(`tests/defer_test.zig`). See `tests/harness.zig`.
 
 CI runs both suites on Linux and macOS, in `Debug` and `ReleaseSafe`, plus
 a `zig fmt` check and a smoke test that serves a request and shuts down on

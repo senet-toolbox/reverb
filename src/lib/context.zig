@@ -10,7 +10,7 @@ const print = std.debug.print;
 const Server = @import("server.zig");
 const Client = @import("loom").Client;
 const Header = @import("core/Header.zig");
-const Reply = @import("core/ReplyBuilder.zig");
+const Reply = @import("Reply.zig");
 // const Validation = @import("../../core/Validation.zig");
 // const assert_cm = @import("../../utils/index.zig").assert_cm;
 const dom = @import("core/simdjson/dom.zig");
@@ -93,6 +93,18 @@ req_cookies: []Cookie = undefined,
 parser: *dom.Parser = undefined,
 header_buf: [4096]u8 = undefined,
 header_buf_len: usize = 0,
+/// Set by `deferReply`: the handler handed this request's response to a
+/// `Reply`, so the server must neither answer it nor serve the requests
+/// pipelined behind it until the reply is sent.
+deferred: bool = false,
+/// How `deferReply` reaches the server that owns this context. Set once by
+/// the server when the context is created, and kept across `clear`.
+defer_hook: ?DeferHook = null,
+
+pub const DeferHook = struct {
+    server: *anyopaque,
+    deferFn: *const fn (server: *anyopaque, ctx: *Self) anyerror!*Reply,
+};
 
 pub fn init(
     arena: mem.Allocator,
@@ -187,6 +199,7 @@ pub fn clear(self: *Self) void {
     self.req_cookie_index = 0;
     self.content_length = 0;
     self.close_requested = false;
+    self.deferred = false;
     // Both of these must be cleared: contexts are pooled and reused per
     // connection slot, so a stale payload would otherwise be visible to the
     // next request that happens not to carry a body.
@@ -230,78 +243,162 @@ pub fn addFormParam(self: *Self, key: []const u8, value: []const u8) !void {
     try self.form_params.put(key, value);
 }
 
-fn generateCookieString(self: *Self) ![]const u8 {
-    if (self.cookies.count() == 0) {
-        return "\r\n";
-    }
-    // Pre-calculate required buffer size to avoid reallocations
-    var estimated_size: usize = 0;
-    var cookies_itr = self.cookies.iterator();
-    while (cookies_itr.next()) |entry| {
-        const key = entry.key_ptr.*;
-        const cookie = entry.value_ptr.*;
-        // "Set-Cookie: " + key + "=" + value + "; Path=/;\r\n" + extras
-        estimated_size += 12 + key.len + 1 + cookie.value.len + 10 + 2; // base components
-        if (cookie.secure) estimated_size += 7; // "Secure;"
-        if (cookie.expires != null) estimated_size += 20; // "Max-Age=XXXXXXX;" (rough estimate)
-        if (cookie.http_only) estimated_size += 8; // "HttpOnly"
-    }
-
-    // Create array_list.Managed with pre-allocated capacity
-    var buffer_cookie = try std.array_list.Managed(u8).initCapacity(self.arena, estimated_size);
-    defer buffer_cookie.deinit();
-
-    // Reset iterator
-    cookies_itr = self.cookies.iterator();
-
+/// Renders the `Set-Cookie` lines for `cookies` into `buf`, one per
+/// cookie, each ending in CRLF. Empty when there are none.
+///
+/// Writes into caller memory rather than allocating: this used to build the
+/// string in the process-lifetime arena and never free it, so every
+/// response that set a cookie leaked its header.
+pub fn renderCookies(cookies: *const std.StringHashMap(Cookie), buf: []u8) ![]const u8 {
+    var end: usize = 0;
+    var cookies_itr = cookies.iterator();
     while (cookies_itr.next()) |entry| {
         const key = entry.key_ptr.*;
         const cookie = entry.value_ptr.*;
 
-        // Use appendSlice instead of multiple write calls for better performance
-        try buffer_cookie.appendSlice("Set-Cookie: ");
-        try buffer_cookie.appendSlice(key);
-        try buffer_cookie.appendSlice("=");
-        try buffer_cookie.appendSlice(cookie.value);
-        try buffer_cookie.appendSlice("; ");
+        try appendTo(buf, &end, "Set-Cookie: ");
+        try appendTo(buf, &end, key);
+        try appendTo(buf, &end, "=");
+        try appendTo(buf, &end, cookie.value);
+        try appendTo(buf, &end, "; ");
 
         if (cookie.secure) {
-            try buffer_cookie.appendSlice("Secure; ");
+            try appendTo(buf, &end, "Secure; ");
         }
 
-        try buffer_cookie.appendSlice("Path=/; ");
+        try appendTo(buf, &end, "Path=/; ");
 
         if (cookie.expires) |expires| {
-            // Use a small buffer for number formatting to avoid writer overhead
             var num_buf: [32]u8 = undefined;
             const expires_str = try std.fmt.bufPrint(&num_buf, "Max-Age={d}; ", .{expires});
-            try buffer_cookie.appendSlice(expires_str);
+            try appendTo(buf, &end, expires_str);
         }
 
         if (cookie.http_only) {
-            try buffer_cookie.appendSlice("HttpOnly; ");
+            try appendTo(buf, &end, "HttpOnly; ");
         }
 
-        // Remove trailing "; " and add CRLF
-        if (buffer_cookie.items.len >= 2 and
-            std.mem.eql(u8, buffer_cookie.items[buffer_cookie.items.len - 2 ..], "; "))
-        {
-            buffer_cookie.shrinkRetainingCapacity(buffer_cookie.items.len - 2);
-        }
-        try buffer_cookie.appendSlice("\r\n");
+        // Replace the trailing "; " with the line ending.
+        end -= 2;
+        try appendTo(buf, &end, "\r\n");
     }
-
-    try buffer_cookie.appendSlice("\r\n");
-    return buffer_cookie.toOwnedSlice();
+    return buf[0..end];
 }
 
 const ctnt = "Content-Length: ";
 
-fn headerAppend(self: *Self, end: *usize, slice: []const u8) !void {
+fn appendTo(buf: []u8, end: *usize, slice: []const u8) !void {
     const next = end.* + slice.len;
-    if (next > self.header_buf.len) return error.HeaderBufferOverflow;
-    @memcpy(self.header_buf[end.*..next], slice);
+    if (next > buf.len) return error.HeaderBufferOverflow;
+    @memcpy(buf[end.*..next], slice);
     end.* = next;
+}
+
+/// Everything a response head depends on, as plain values.
+///
+/// Both `Context`, answering inside the handler, and `Reply`, answering
+/// later from a posted task, build their heads from this through
+/// `writeHead`, so the two paths cannot drift apart.
+pub const Head = struct {
+    /// Including its CRLF, and any lines that belong with it (`Vary`).
+    status_line: []const u8,
+    /// Whether the connection closes after this response.
+    close: bool,
+    content_type: []const u8,
+    content_length: usize,
+    include_date: bool = true,
+    extra_header_name: ?[]const u8 = null,
+    extra_header_value: ?[]const u8 = null,
+    /// The request's `Access-Control-Request-Headers`, echoed back.
+    allow_headers: []const u8 = "",
+    /// Rendered `Set-Cookie` lines, from `renderCookies`.
+    cookies: []const u8 = "",
+};
+
+/// The most `writeHead` adds beyond the variable-length parts of `head`
+/// and the CORS block: status reason, `Connection`, `Date`, header names
+/// and the content length. Generous, so a buffer sized with it never
+/// overflows.
+pub const head_overhead = 512;
+
+/// The buffer size that is always enough for `writeHead(head)`.
+pub fn headCapacity(head: Head) usize {
+    const cors_len = if (cors_headers) |ch| ch.len else 0;
+    const extra_len = if (head.extra_header_name) |name|
+        name.len + if (head.extra_header_value) |value| value.len else 0
+    else
+        0;
+    return head_overhead + head.status_line.len + head.content_type.len +
+        extra_len + cors_len + head.allow_headers.len + head.cookies.len;
+}
+
+/// Writes a complete response head, through the blank line, into `buf`
+/// and returns its length.
+///
+/// Loop thread only when `include_date` is set: `httpDate` updates a
+/// shared cache.
+pub fn writeHead(buf: []u8, head: Head) !usize {
+    var end: usize = 0;
+
+    try appendTo(buf, &end, head.status_line);
+
+    // Emitted here rather than baked into each status line, so every
+    // response -- success, error, preflight, file -- reports the same
+    // connection handling the server actually performs.
+    try appendTo(buf, &end, if (head.close)
+        "Connection: close\r\n"
+    else
+        "Connection: keep-alive\r\n");
+
+    try appendTo(buf, &end, "Content-Type: ");
+    try appendTo(buf, &end, head.content_type);
+    try appendTo(buf, &end, "\r\n");
+
+    if (head.include_date) {
+        const date_str = httpDate();
+        try appendTo(buf, &end, "Date: ");
+        try appendTo(buf, &end, date_str);
+        try appendTo(buf, &end, "\r\n");
+    }
+
+    if (head.extra_header_name) |name| {
+        if (head.extra_header_value) |value| {
+            try appendTo(buf, &end, name);
+            try appendTo(buf, &end, ": ");
+            try appendTo(buf, &end, value);
+            try appendTo(buf, &end, "\r\n");
+        }
+    }
+
+    if (cors_headers) |ch| {
+        try appendTo(buf, &end, ch);
+    }
+
+    if (head.allow_headers.len > 0) {
+        try appendTo(buf, &end, "Access-Control-Allow-Headers: ");
+        try appendTo(buf, &end, head.allow_headers);
+        try appendTo(buf, &end, "\r\n");
+    }
+
+    try appendTo(buf, &end, ctnt);
+    var len_buf: [20]u8 = undefined;
+    const len_str = try std.fmt.bufPrint(&len_buf, "{}", .{head.content_length});
+    try appendTo(buf, &end, len_str);
+    try appendTo(buf, &end, "\r\n");
+
+    try appendTo(buf, &end, head.cookies);
+    try appendTo(buf, &end, "\r\n");
+
+    return end;
+}
+
+/// Formats the status line every response with a numeric status uses.
+pub fn statusLine(buf: []u8, status_code: u16) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\n",
+        .{ status_code, statusReason(status_code) },
+    );
 }
 
 fn buildStandardHeaders(
@@ -313,59 +410,70 @@ fn buildStandardHeaders(
     extra_header_name: ?[]const u8,
     extra_header_value: ?[]const u8,
 ) !usize {
-    var end: usize = 0;
-
-    try self.headerAppend(&end, status_line);
-
-    // Emitted here rather than baked into each status line, so every
-    // response -- success, error, preflight, file -- reports the same
-    // connection handling the server actually performs.
-    try self.headerAppend(&end, if (self.close_requested)
-        "Connection: close\r\n"
-    else
-        "Connection: keep-alive\r\n");
-
-    try self.headerAppend(&end, "Content-Type: ");
-    try self.headerAppend(&end, content_type);
-    try self.headerAppend(&end, "\r\n");
-
-    if (include_date) {
-        const date_str = httpDate();
-        try self.headerAppend(&end, "Date: ");
-        try self.headerAppend(&end, date_str);
-        try self.headerAppend(&end, "\r\n");
-    }
-
-    if (extra_header_name) |name| {
-        if (extra_header_value) |value| {
-            try self.headerAppend(&end, name);
-            try self.headerAppend(&end, ": ");
-            try self.headerAppend(&end, value);
-            try self.headerAppend(&end, "\r\n");
-        }
-    }
-
-    if (cors_headers) |ch| {
-        try self.headerAppend(&end, ch);
-    }
-
-    if (self.http_header.accept_control_request_headers.len > 0) {
-        try self.headerAppend(&end, "Access-Control-Allow-Headers: ");
-        try self.headerAppend(&end, self.http_header.accept_control_request_headers);
-        try self.headerAppend(&end, "\r\n");
-    }
-
-    try self.headerAppend(&end, ctnt);
-    var len_buf: [20]u8 = undefined;
-    const len_str = try std.fmt.bufPrint(&len_buf, "{}", .{content_length});
-    try self.headerAppend(&end, len_str);
-    try self.headerAppend(&end, "\r\n");
-
-    const cookie_str = try self.generateCookieString();
-    try self.headerAppend(&end, cookie_str);
-
+    var cookie_buf: [2048]u8 = undefined;
+    const end = try writeHead(&self.header_buf, .{
+        .status_line = status_line,
+        .close = self.close_requested,
+        .content_type = content_type,
+        .content_length = content_length,
+        .include_date = include_date,
+        .extra_header_name = extra_header_name,
+        .extra_header_value = extra_header_value,
+        .allow_headers = self.http_header.accept_control_request_headers,
+        .cookies = try renderCookies(self.cookies, &cookie_buf),
+    });
     self.header_buf_len = end;
     return end;
+}
+
+/// Answers with `status`, `content_type` and `body`.
+///
+/// The in-handler counterpart of `Reply.send`, with the same signature, so
+/// a handler can move between answering now and answering later without
+/// the response changing.
+pub fn SEND(self: *Self, status: u16, content_type: []const u8, payload: []const u8) !void {
+    var status_line_buf: [128]u8 = undefined;
+    var end = try self.buildStandardHeaders(
+        try statusLine(&status_line_buf, status),
+        content_type,
+        payload.len,
+        true,
+        null,
+        null,
+    );
+
+    if (end + payload.len <= self.header_buf.len) {
+        const start = end;
+        end += payload.len;
+        @memcpy(self.header_buf[start..end], payload);
+        try self.client.?.write(self.header_buf[0..end]);
+        return;
+    }
+
+    try self.client.?.write(self.header_buf[0..end]);
+    try stream(self.client.?, payload);
+}
+
+/// Takes over answering this request, so the handler can return before the
+/// response is ready and the work can finish on another thread.
+///
+/// The returned `Reply` carries everything the response needs, since the
+/// context is reused as soon as the handler returns: read the request (body,
+/// params) and copy what the job needs *before* returning. Until the reply
+/// is sent the connection reads nothing further, so requests pipelined
+/// behind this one wait their turn, and the idle timeout gives way to the
+/// server's reply timeout.
+///
+/// Make this the last fallible step: once it succeeds, the handler must
+/// arrange for `reply.send` to be called exactly once, even on failure
+/// (answer 503, say). An error the handler returns afterwards is logged and
+/// otherwise ignored, because the reply owns the response.
+pub fn deferReply(self: *Self) !*Reply {
+    if (self.deferred) return error.AlreadyDeferred;
+    const hook = self.defer_hook orelse return error.DeferUnavailable;
+    const reply = try hook.deferFn(hook.server, self);
+    self.deferred = true;
+    return reply;
 }
 
 pub fn ERROR(self: *Self, status_code: u16, payload: []const u8) !void {
@@ -373,11 +481,7 @@ pub fn ERROR(self: *Self, status_code: u16, payload: []const u8) !void {
     // An error status is not by itself a reason to drop the connection: a
     // 404 answers a perfectly well-formed request. The Connection header
     // comes from `buildStandardHeaders` like every other response.
-    const status_line = try std.fmt.bufPrint(
-        &status_line_buf,
-        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\n",
-        .{ status_code, statusReason(status_code) },
-    );
+    const status_line = try statusLine(&status_line_buf, status_code);
 
     var end = try self.buildStandardHeaders(
         status_line,
@@ -402,11 +506,7 @@ pub fn ERROR(self: *Self, status_code: u16, payload: []const u8) !void {
 
 pub fn STATUS(self: *Self, status_code: u16, payload: []const u8) !void {
     var status_line_buf: [128]u8 = undefined;
-    const status_line = try std.fmt.bufPrint(
-        &status_line_buf,
-        "HTTP/1.1 {d} {s}\r\nVary: Origin\r\n",
-        .{ status_code, statusReason(status_code) },
-    );
+    const status_line = try statusLine(&status_line_buf, status_code);
 
     const content_type = self.http_header.content_type.toString();
     var end = try self.buildStandardHeaders(
@@ -451,7 +551,8 @@ fn statusReason(code: u16) []const u8 {
 
 // Look into redirecting users
 pub fn REDIRECT(self: *Self, location: []const u8) !void {
-    const cookie_str = try self.generateCookieString();
+    var cookie_buf: [2048]u8 = undefined;
+    const cookie_lines = try renderCookies(self.cookies, &cookie_buf);
 
     const redirect_resp =
         "HTTP/1.1 302 Found\r\n" ++
@@ -506,10 +607,14 @@ pub fn REDIRECT(self: *Self, location: []const u8) !void {
     @memcpy(buffer[start..end], content_len);
     start += content_len.len;
 
-    // Cookies
-    end += cookie_str.len;
-    @memcpy(buffer[start..end], cookie_str);
-    start += cookie_str.len;
+    // Cookies, then the blank line that ends the head.
+    end += cookie_lines.len;
+    @memcpy(buffer[start..end], cookie_lines);
+    start += cookie_lines.len;
+
+    end += 2;
+    @memcpy(buffer[start..end], "\r\n");
+    start += 2;
     std.debug.print("total: {s}\n", .{buffer[0..end]});
 
     try stream(self.client.?, buffer[0..end]);

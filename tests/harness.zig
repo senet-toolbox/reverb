@@ -17,6 +17,14 @@ pub const Config = struct {
     port: u16 = 0,
     max: usize = 64,
     max_body_size: usize = 64 * 1024,
+    reply_timeout_ms: i64 = 300_000,
+};
+
+pub const Options = struct {
+    reply_timeout_ms: i64 = 300_000,
+    /// Where deferred replies are allocated. Defaults to the test's own
+    /// allocator, so a reply that is never freed fails the test.
+    reply_allocator: ?std.mem.Allocator = null,
 };
 
 const Server = reverb.Server(Config);
@@ -38,6 +46,7 @@ pub const Harness = struct {
     server: *Server,
     thread: std.Thread,
     port: u16,
+    serving: bool = true,
 
     /// Starts a server with `routes` registered and waits until it is
     /// accepting connections.
@@ -49,6 +58,14 @@ pub const Harness = struct {
         allocator: std.mem.Allocator,
         routes: []const Route,
     ) !Harness {
+        return startWith(allocator, routes, .{});
+    }
+
+    pub fn startWith(
+        allocator: std.mem.Allocator,
+        routes: []const Route,
+        options: Options,
+    ) !Harness {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(allocator);
         errdefer {
@@ -59,8 +76,9 @@ pub const Harness = struct {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
-        try server.new(.{}, arena.allocator());
+        try server.new(.{ .reply_timeout_ms = options.reply_timeout_ms }, arena.allocator());
         errdefer server.deinit();
+        server.reply_allocator = options.reply_allocator orelse allocator;
 
         for (routes) |route| {
             switch (route.method) {
@@ -90,9 +108,18 @@ pub const Harness = struct {
         };
     }
 
-    pub fn stop(h: *Harness) void {
+    /// Stops the event loop and waits for it, leaving the server to be
+    /// torn down by `stop`. Split out so worker pools can be shut down in
+    /// between, which is the order a real application needs. Idempotent.
+    pub fn stopServing(h: *Harness) void {
+        if (!h.serving) return;
+        h.serving = false;
         h.server.stop();
         h.thread.join();
+    }
+
+    pub fn stop(h: *Harness) void {
+        h.stopServing();
         h.server.deinit();
         h.allocator.destroy(h.server);
         h.arena.deinit();
@@ -371,4 +398,5 @@ pub fn body(response: []const u8) ![]const u8 {
 
 test {
     _ = @import("http_test.zig");
+    _ = @import("defer_test.zig");
 }

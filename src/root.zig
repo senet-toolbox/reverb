@@ -9,6 +9,8 @@ pub const Server = @import("lib/server.zig").Server; // Weird thing where if i i
 pub const Treehouse = @import("lib/treehouse.zig");
 pub const TrackingAllocator = @import("lib/TrackingAllocator.zig");
 pub const Context = @import("lib/context.zig");
+pub const Reply = @import("lib/Reply.zig");
+pub const Workers = @import("lib/Workers.zig").Workers;
 pub const Tripwire = @import("lib/Tripwire.zig");
 pub const utils = @import("lib/helpers.zig");
 pub const Logger = @import("lib/Logger.zig");
@@ -28,4 +30,5 @@ test {
     _ = @import("lib/Tripwire.zig");
     _ = @import("lib/trees/radix.zig");
     _ = @import("lib/core/simdjson/number_parsing.zig");
+    _ = @import("lib/Workers.zig");
 }

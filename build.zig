@@ -111,8 +111,20 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const check_readme = b.step("check-readme", "Compile the README quickstart");
+    const replying_later_example = b.addExecutable(.{
+        .name = "replying_later",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/replying_later.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "reverb", .module = mod },
+            },
+        }),
+    });
+    const check_readme = b.step("check-readme", "Compile the README examples");
     check_readme.dependOn(&readme_example.step);
+    check_readme.dependOn(&replying_later_example.step);
 
     // ------------------------------------------------------------------
     // Tests.

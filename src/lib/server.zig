@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const Radix = @import("trees/radix.zig");
 const Cors = @import("core/Cors.zig");
 const Context = @import("context.zig");
+const Reply = @import("Reply.zig");
 const Metrics = @import("metrics.zig");
 const Buckets = @import("metrics/Buckets.zig");
 const getAllRoutes = Metrics.getAllRoutes;
@@ -57,6 +58,10 @@ pub fn Server(comptime Config: type) type {
         /// `/metrics/allroutes`. Allocated from this server's arena, so it
         /// has to live on the instance — see `Metrics.EndPoints`.
         end_points: EndPoints = .{},
+        /// Where `Context.deferReply` allocates its `Reply`. Must be
+        /// threadsafe: a reply is filled on a worker thread and freed on
+        /// the loop thread. `arena` usually is not. Set before `listen`.
+        reply_allocator: Allocator = std.heap.smp_allocator,
 
         // ctx: *Context = undefined,
 
@@ -135,10 +140,10 @@ pub fn Server(comptime Config: type) type {
         /// `read()` returned — so reassembly is Reverb's job. These are
         /// indexed by `client.slot`, which loom guarantees is unique among
         /// live connections, and a slot can be reused once its connection
-        /// closes; `socket` is what distinguishes the new occupant from the
-        /// old one.
+        /// closes; `generation` is what distinguishes the new occupant from
+        /// the old one.
         const RequestBuffer = struct {
-            socket: ?posix.socket_t = null,
+            generation: ?u32 = null,
             data: ?[]u8 = null,
             len: usize = 0,
             /// Bytes at the front already served. Non-zero only while a
@@ -190,15 +195,17 @@ pub fn Server(comptime Config: type) type {
                 chunk: []const u8,
                 max_len: usize,
             ) !void {
-                // Only a different socket means a different connection has
-                // taken over this slot. `client.read_timeout` must not be
-                // part of this test: it is an idle deadline that loom
-                // refreshes on every read, so comparing it discarded the
-                // bytes buffered so far every time a request arrived in
-                // more than one packet.
-                if (self.socket == null or self.socket.? != client.socket) {
+                // Only a different generation means a different connection
+                // has taken over this slot. Not the socket: the kernel
+                // hands a closed descriptor's number to the next accept, so
+                // a new connection could inherit the old one's unserved
+                // bytes. Nor `client.read_timeout`: it is an idle deadline
+                // that loom refreshes on every read, so comparing it
+                // discarded the bytes buffered so far every time a request
+                // arrived in more than one packet.
+                if (self.generation == null or self.generation.? != client.generation) {
                     self.reset(allocator);
-                    self.socket = client.socket;
+                    self.generation = client.generation;
                 }
 
                 // Reclaim any already-served prefix before measuring room,
@@ -735,6 +742,11 @@ pub fn Server(comptime Config: type) type {
                 .server_port = config.port,
                 .max = config.max,
                 .max_body_size = config.max_body_size,
+                // How long a deferred request may wait for its reply.
+                .reply_timeout_ms = if (@hasField(Config, "reply_timeout_ms"))
+                    config.reply_timeout_ms
+                else
+                    (loompkg.Loom(*Reverb).Config{}).reply_timeout_ms,
             }, arena, target);
 
             var logger: Logger = undefined;
@@ -775,10 +787,15 @@ pub fn Server(comptime Config: type) type {
                     null,
                     20,
                 );
+                ctx_op.defer_hook = .{ .server = target, .deferFn = deferReplyHook };
                 target.context_slots[i] = ctx_op;
             }
         }
 
+        /// Tears the server down. Call it once `listen` has returned, and
+        /// after every `Workers` pool that may still `send` a reply has
+        /// been `deinit`ed: loom's teardown runs the replies they posted,
+        /// which find their connections closed and free themselves.
         pub fn deinit(self: *Reverb) void {
             // Clear the signal handler's target first: once this instance is
             // torn down, a late signal must not reach it.
@@ -786,6 +803,11 @@ pub fn Server(comptime Config: type) type {
             if (Metrics.active_end_points == &self.end_points) {
                 Metrics.active_end_points = null;
             }
+
+            // First, while everything a reply task might touch still
+            // exists: loom closes every connection and then runs the
+            // replies posted after the loop stopped.
+            self.loom.deinit();
 
             // Contexts are pooled one per connection slot and allocate
             // buffers at startup; nothing used to release them.
@@ -801,7 +823,6 @@ pub fn Server(comptime Config: type) type {
                 request_buffer.reset(self.arena);
             }
             self.arena.free(self.request_buffers);
-            self.loom.deinit();
             if (self.end_points.GET) |ep_get| {
                 for (ep_get) |elem| {
                     self.arena.free(elem);
@@ -994,12 +1015,9 @@ pub fn Server(comptime Config: type) type {
 
         pub fn handle(
             reverb: *Reverb,
-            new_client: *Client,
-            new_recv_data: []const u8,
+            client: *Client,
+            recv_data: []const u8,
         ) !void {
-            var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
-            const client = new_client;
-            const recv_data = new_recv_data;
             if (recv_data.len == 0) {
                 // Browsers (or firefox?) attempt to optimize for speed
                 // by opening a connection to the server once a user highlights
@@ -1010,45 +1028,8 @@ pub fn Server(comptime Config: type) type {
                 return;
             }
 
-            const ctx = reverb.context_slots[client.slot];
-
-            defer ctx.clear();
-
-            ctx.client = client;
-
             if (client.client_type == .WebSocket) {
-                if (recv_data.len > recv_buf.len) return error.MalformedRequest;
-                @memcpy(recv_buf[0..recv_data.len], recv_data[0..]);
-                ctx.client.?.msg = recv_buf[0..recv_data.len];
-
-                var ws = client.ws orelse {
-                    print("Parser not found\n", .{});
-                    return;
-                };
-
-                // Feed the received data into the parser
-                ws.parser.feed(recv_buf[0..recv_data.len]) catch |err| {
-                    print("Parser feed error: {any}\n", .{err});
-                    return;
-                };
-
-                // Now try to parse the message
-                const message = ws.receiveMessage(true) catch |err| {
-                    if (err == error.IncompleteFrame) {
-                        // Need more data - this is normal, just wait for next recv
-                        return;
-                    }
-                    print("Parser ReceiveMessage WebSocket: Error: {any}\n", .{err});
-                    return;
-                };
-
-                var wss: WSS = reverb.wss orelse {
-                    std.debug.print("No wss\n", .{});
-                    return;
-                };
-
-                try wss.onMessage(ws, message, ctx);
-                return;
+                return reverb.handleWebSocket(client, recv_data);
             }
 
             if (client.slot >= reverb.request_buffers.len) return error.ContextSlotOutOfRange;
@@ -1061,9 +1042,67 @@ pub fn Server(comptime Config: type) type {
             const max_request_size = Reverb.MAX_RECV_SIZE + helpers.MAX_HEADER_SIZE;
             request_buffer.append(reverb.arena, client, recv_data, max_request_size) catch |err| {
                 request_buffer.reset(reverb.arena);
+                const ctx = reverb.context_slots[client.slot];
+                defer ctx.clear();
+                ctx.client = client;
                 try respondToFramingError(ctx, err);
                 return err;
             };
+
+            try reverb.serveBuffered(client);
+        }
+
+        fn handleWebSocket(reverb: *Reverb, client: *Client, recv_data: []const u8) !void {
+            var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
+            const ctx = reverb.context_slots[client.slot];
+            defer ctx.clear();
+            ctx.client = client;
+
+            if (recv_data.len > recv_buf.len) return error.MalformedRequest;
+            @memcpy(recv_buf[0..recv_data.len], recv_data[0..]);
+            ctx.client.?.msg = recv_buf[0..recv_data.len];
+
+            var ws = client.ws orelse {
+                print("Parser not found\n", .{});
+                return;
+            };
+
+            // Feed the received data into the parser
+            ws.parser.feed(recv_buf[0..recv_data.len]) catch |err| {
+                print("Parser feed error: {any}\n", .{err});
+                return;
+            };
+
+            // Now try to parse the message
+            const message = ws.receiveMessage(true) catch |err| {
+                if (err == error.IncompleteFrame) {
+                    // Need more data - this is normal, just wait for next recv
+                    return;
+                }
+                print("Parser ReceiveMessage WebSocket: Error: {any}\n", .{err});
+                return;
+            };
+
+            var wss: WSS = reverb.wss orelse {
+                std.debug.print("No wss\n", .{});
+                return;
+            };
+
+            try wss.onMessage(ws, message, ctx);
+        }
+
+        /// Serves every complete request in `client`'s request buffer, in
+        /// order, stopping early at one whose reply was deferred.
+        ///
+        /// Called after each read, and again once a deferred reply has been
+        /// sent, for whatever was pipelined behind it.
+        fn serveBuffered(reverb: *Reverb, client: *Client) !void {
+            var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
+            const request_buffer = &reverb.request_buffers[client.slot];
+            const ctx = reverb.context_slots[client.slot];
+
+            defer ctx.clear();
+            ctx.client = client;
 
             while (true) {
                 const pending = request_buffer.bytes();
@@ -1113,6 +1152,12 @@ pub fn Server(comptime Config: type) type {
                 ctx.client = client;
                 try serveRequest(reverb, client, ctx, recv_buf[0..request_len], body_len);
 
+                // The reply answers this one later. Whatever is pipelined
+                // behind it stays buffered until then (and reads are paused,
+                // so nothing more arrives): serving it now would answer
+                // out of order.
+                if (ctx.deferred) return;
+
                 // A client that asked to close gets closed, and anything it
                 // pipelined behind that request is discarded -- it told us it
                 // was done.
@@ -1122,8 +1167,85 @@ pub fn Server(comptime Config: type) type {
                     return;
                 }
             }
+        }
 
-            return;
+        /// `Context.deferReply`, with the server in hand.
+        fn deferReplyHook(server: *anyopaque, ctx: *Context) anyerror!*Reply {
+            const reverb: *Reverb = @ptrCast(@alignCast(server));
+            const client = ctx.client orelse return error.NoClient;
+
+            var cookie_buf: [2048]u8 = undefined;
+            const reply = try Reply.create(reverb.reply_allocator, .{
+                .server = reverb,
+                .post = postReply,
+                .run = runReply,
+                .slot = client.slot,
+                .generation = client.generation,
+                .close_requested = ctx.close_requested,
+                .allow_headers = ctx.http_header.accept_control_request_headers,
+                .cookies = try Context.renderCookies(ctx.cookies, &cookie_buf),
+            });
+
+            // Nothing pipelined behind this request may be served before
+            // it is answered, and the connection is now quiet by design.
+            client.pauseReads() catch |err| {
+                reply.destroy();
+                // Reads are in an unknown state; the connection cannot be
+                // served correctly any more.
+                reverb.loom.closeClient(client);
+                return err;
+            };
+            reverb.loom.awaitReply(client);
+            return reply;
+        }
+
+        fn postReply(server: *anyopaque, task: *loompkg.Task) void {
+            const reverb: *Reverb = @ptrCast(@alignCast(server));
+            reverb.loom.post(task);
+        }
+
+        /// Runs on the loop thread, for each reply `send` posted.
+        fn runReply(task: *loompkg.Task) void {
+            const reply: *Reply = @fieldParentPtr("task", task);
+            const reverb: *Reverb = @ptrCast(@alignCast(reply.server));
+            defer reply.destroy();
+            reverb.deliverReply(reply);
+        }
+
+        fn deliverReply(reverb: *Reverb, reply: *Reply) void {
+            // Gone if it closed meanwhile -- hung up, timed out, or the
+            // server shutting down -- even if a new connection has since
+            // taken its slot.
+            const client = reverb.loom.clientAt(reply.slot, reply.generation) orelse return;
+
+            const response = reply.render() orelse {
+                // `send` could not allocate a response. Closing tells the
+                // client at once instead of after the reply timeout.
+                reverb.loom.closeClient(client);
+                return;
+            };
+            client.write(response) catch {
+                reverb.loom.closeClient(client);
+                return;
+            };
+            reverb.loom.finishReply(client);
+
+            if (reply.close_requested) {
+                reverb.closeWhenDrained(client);
+                reverb.request_buffers[client.slot].reset(reverb.arena);
+                return;
+            }
+
+            client.resumeReads() catch {
+                reverb.loom.closeClient(client);
+                return;
+            };
+
+            // Requests that arrived pipelined behind the deferred one are
+            // already buffered, so no read will come along to serve them.
+            reverb.serveBuffered(client) catch {
+                reverb.loom.closeClient(client);
+            };
         }
 
         /// Closes the connection once its response has finished sending.
@@ -1283,7 +1405,17 @@ pub fn Server(comptime Config: type) type {
                 reverb.logger.err("{any} Method: {s} Path: {s}", .{ err, ctx_pm.method, ctx_pm.path }, null) catch |log_err| {
                     std.log.err("Logger Error: {any}", .{log_err});
                 };
-                ctx.ERROR(404, "") catch |write_err| {
+                // The reply owns the response. Answering here as well would
+                // send two responses to one request.
+                if (ctx.deferred) return;
+
+                // A route that does not exist is the client's mistake; a
+                // handler that failed is the server's.
+                const status: u16 = switch (err) {
+                    error.RouteNotSupported, error.MethodNotSupported, error.SearchRoute => 404,
+                    else => 500,
+                };
+                ctx.ERROR(status, "") catch |write_err| {
                     return write_err;
                 };
                 // Deliberately not an error: loom closes the connection when
