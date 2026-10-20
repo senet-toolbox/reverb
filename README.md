@@ -164,6 +164,9 @@ The whole program is `examples/replying_later.zig`, compiled by
   response it produces is the one `ctx.SEND` would have; CORS headers,
   cookies set before deferring and `Connection: close` are all carried
   over. A handler error after `deferReply` is logged, not answered.
+- **`reply.sendWithCookies(status, content_type, body, cookies)`** also
+  sets cookies the work decided, such as the session a sign-in issues.
+  They follow any the handler set before deferring.
 - **`reverb.Workers(Job, run)`** is a fixed set of threads reading a
   bounded queue. `submit` never blocks: a full queue is `error.Busy`, so
   the handler can answer 503. Use one pool per kind of work, so slow work

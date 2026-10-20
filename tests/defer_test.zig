@@ -22,6 +22,8 @@ const Job = struct {
     reply: *reverb.Reply,
     /// Owned by the job: the request body, echoed back as the response.
     body: []u8,
+    /// Set by the worker, as a sign-in sets its session.
+    cookies: []const reverb.Cookie = &.{},
 };
 
 /// How long each job takes. Set per test, before the server starts.
@@ -31,7 +33,7 @@ fn runJob(job: Job) void {
     defer testing.allocator.free(job.body);
     const delay = job_delay_ms.load(.acquire);
     if (delay > 0) sleepMs(delay);
-    job.reply.send(200, "text/plain", job.body);
+    job.reply.sendWithCookies(200, "text/plain", job.body, job.cookies);
 }
 
 const Pool = reverb.Workers(Job, runJob);
@@ -74,6 +76,21 @@ fn directWithCookie(ctx: *reverb.Context) !void {
     try directEcho(ctx);
 }
 
+/// Sets one cookie before deferring; the worker sets another.
+fn deferredSignIn(ctx: *reverb.Context) !void {
+    try ctx.addCookie(.{ .name = "before", .value = "1" });
+    const body = try testing.allocator.dupe(u8, ctx.body());
+    const reply = ctx.deferReply() catch |err| {
+        testing.allocator.free(body);
+        return err;
+    };
+    const session = [_]reverb.Cookie{.{ .name = "session", .value = "s1", .http_only = true, .same_site = .lax }};
+    pool.submit(.{ .reply = reply, .body = body, .cookies = &session }) catch {
+        testing.allocator.free(body);
+        reply.send(503, "text/plain", "busy");
+    };
+}
+
 /// Defers, then fails. The reply still answers; nothing else may.
 fn deferThenFail(ctx: *reverb.Context) !void {
     try deferredEcho(ctx);
@@ -96,6 +113,7 @@ const routes = [_]Route{
     .{ .method = .POST, .path = "/slow-cookie", .handler = deferredWithCookie },
     .{ .method = .POST, .path = "/direct-cookie", .handler = directWithCookie },
     .{ .method = .POST, .path = "/fail", .handler = deferThenFail },
+    .{ .method = .POST, .path = "/sign-in", .handler = deferredSignIn },
     .{ .method = .GET, .path = "/fast", .handler = fast },
     .{ .method = .GET, .path = "/slot", .handler = slot },
 };
@@ -218,6 +236,21 @@ test "a deferred response is the response a direct one would be" {
         try testing.expect(std.mem.indexOf(u8, responses[0], "Access-Control-Allow-Origin: *\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, responses[0], "Access-Control-Allow-Headers: X-Token\r\n") != null);
     }
+}
+
+// Catches: cookies the worker decides (a sign-in's session) dropped, or
+// replacing those the handler set before deferring.
+test "cookies a worker sets are sent, after the handler's" {
+    var f = try Fixture.start(0, .{}, .{});
+    defer f.stop();
+
+    const response = try f.h.roundTrip(post("/sign-in", "hello"));
+    defer testing.allocator.free(response);
+    try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+    try testing.expectEqualStrings("hello", try harness.body(response));
+    const before = std.mem.indexOf(u8, response, "Set-Cookie: before=1; Path=/\r\n") orelse return error.HandlerCookieMissing;
+    const session = std.mem.indexOf(u8, response, "Set-Cookie: session=s1; Path=/; HttpOnly; SameSite=Lax\r\n") orelse return error.WorkerCookieMissing;
+    try testing.expect(before < session);
 }
 
 // Catches: reads never resumed after the reply, so the connection hangs.

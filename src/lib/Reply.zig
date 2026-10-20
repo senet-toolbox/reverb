@@ -15,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Task = @import("loom").Task;
 const Context = @import("context.zig");
+const Cookie = @import("core/Cookie.zig");
 
 const Reply = @This();
 
@@ -44,12 +45,15 @@ cookies: []const u8,
 /// Guards against a second `send`.
 sent: std.atomic.Value(bool) = .init(false),
 
-/// Filled by `send`. `storage` holds the content type, then room for the
-/// head, then the body, so the loop can write the head in front of the
-/// body and send the whole response with one `write`.
+/// Filled by `send`. `storage` holds the content type, the `Set-Cookie`
+/// lines, room for the head, then the body, so the loop can write the head
+/// in front of the body and send the whole response with one `write`.
 status: u16 = 0,
 storage: []u8 = &.{},
 content_type_len: usize = 0,
+/// The cookie lines' share of `storage`, and how much of it they use.
+cookie_room: usize = 0,
+cookie_len: usize = 0,
 head_room: usize = 0,
 
 pub const Captured = struct {
@@ -109,26 +113,45 @@ pub fn destroy(reply: *Reply) void {
 /// instead, since there is no response to send and the client would
 /// otherwise wait out the reply timeout.
 pub fn send(reply: *Reply, status: u16, content_type: []const u8, body: []const u8) void {
+    reply.sendWithCookies(status, content_type, body, &.{});
+}
+
+/// `send`, also setting `cookies`, for work that decides them (a sign-in
+/// issuing a session). They come after any cookies the handler set before
+/// `deferReply`. Copied like the rest.
+pub fn sendWithCookies(reply: *Reply, status: u16, content_type: []const u8, body: []const u8, cookies: []const Cookie) void {
     const already_sent = reply.sent.swap(true, .acq_rel);
     std.debug.assert(!already_sent); // `send` called twice
     if (already_sent) return;
 
+    var cookie_room = reply.cookies.len;
+    for (cookies) |cookie| cookie_room += Context.cookieCapacity(cookie);
+
     // Sized for the head here, but the head itself is built on the loop
-    // thread: `httpDate` writes a shared cache.
-    const head_room = Context.headCapacity(.{
+    // thread: `httpDate` writes a shared cache. It repeats the cookie
+    // lines, hence their room again.
+    const head_room = cookie_room + Context.headCapacity(.{
         .status_line = "",
         .close = reply.close_requested,
         .content_type = content_type,
         .content_length = body.len,
         .allow_headers = reply.allow_headers,
-        .cookies = reply.cookies,
     });
 
-    if (reply.allocator.alloc(u8, content_type.len + head_room + body.len)) |storage| {
+    if (reply.allocator.alloc(u8, content_type.len + cookie_room + head_room + body.len)) |storage| {
         @memcpy(storage[0..content_type.len], content_type);
-        @memcpy(storage[content_type.len + head_room ..], body);
+        const cookie_buf = storage[content_type.len..][0..cookie_room];
+        @memcpy(cookie_buf[0..reply.cookies.len], reply.cookies);
+        var cookie_len = reply.cookies.len;
+        for (cookies) |cookie| {
+            // Cannot overflow: `cookie_room` counted each one's capacity.
+            Context.renderCookie(cookie, cookie_buf, &cookie_len) catch unreachable;
+        }
+        @memcpy(storage[content_type.len + cookie_room + head_room ..], body);
         reply.storage = storage;
         reply.content_type_len = content_type.len;
+        reply.cookie_room = cookie_room;
+        reply.cookie_len = cookie_len;
         reply.head_room = head_room;
         reply.status = status;
     } else |_| {
@@ -144,24 +167,26 @@ pub fn render(reply: *Reply) ?[]const u8 {
     if (reply.status == 0) return null;
 
     const content_type = reply.storage[0..reply.content_type_len];
-    const body_start = reply.content_type_len + reply.head_room;
+    const cookie_lines = reply.storage[reply.content_type_len..][0..reply.cookie_len];
+    const head_start = reply.content_type_len + reply.cookie_room;
+    const body_start = head_start + reply.head_room;
     const body = reply.storage[body_start..];
 
     var status_line_buf: [128]u8 = undefined;
     const status_line = Context.statusLine(&status_line_buf, reply.status) catch return null;
 
-    const head_buf = reply.storage[reply.content_type_len..body_start];
+    const head_buf = reply.storage[head_start..body_start];
     const head_len = Context.writeHead(head_buf, .{
         .status_line = status_line,
         .close = reply.close_requested,
         .content_type = content_type,
         .content_length = body.len,
         .allow_headers = reply.allow_headers,
-        .cookies = reply.cookies,
+        .cookies = cookie_lines,
     }) catch return null;
 
     // Move the head flush against the body, so the two are contiguous.
-    const head_start = body_start - head_len;
-    std.mem.copyBackwards(u8, reply.storage[head_start..body_start], head_buf[0..head_len]);
-    return reply.storage[head_start..];
+    const response_start = body_start - head_len;
+    std.mem.copyBackwards(u8, reply.storage[response_start..body_start], head_buf[0..head_len]);
+    return reply.storage[response_start..];
 }

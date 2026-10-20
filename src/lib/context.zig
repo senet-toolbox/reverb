@@ -252,37 +252,49 @@ pub fn addFormParam(self: *Self, key: []const u8, value: []const u8) !void {
 pub fn renderCookies(cookies: *const std.StringHashMap(Cookie), buf: []u8) ![]const u8 {
     var end: usize = 0;
     var cookies_itr = cookies.iterator();
-    while (cookies_itr.next()) |entry| {
-        const key = entry.key_ptr.*;
-        const cookie = entry.value_ptr.*;
-
-        try appendTo(buf, &end, "Set-Cookie: ");
-        try appendTo(buf, &end, key);
-        try appendTo(buf, &end, "=");
-        try appendTo(buf, &end, cookie.value);
-        try appendTo(buf, &end, "; ");
-
-        if (cookie.secure) {
-            try appendTo(buf, &end, "Secure; ");
-        }
-
-        try appendTo(buf, &end, "Path=/; ");
-
-        if (cookie.expires) |expires| {
-            var num_buf: [32]u8 = undefined;
-            const expires_str = try std.fmt.bufPrint(&num_buf, "Max-Age={d}; ", .{expires});
-            try appendTo(buf, &end, expires_str);
-        }
-
-        if (cookie.http_only) {
-            try appendTo(buf, &end, "HttpOnly; ");
-        }
-
-        // Replace the trailing "; " with the line ending.
-        end -= 2;
-        try appendTo(buf, &end, "\r\n");
-    }
+    while (cookies_itr.next()) |entry| try renderCookie(entry.value_ptr.*, buf, &end);
     return buf[0..end];
+}
+
+/// Appends `cookie`'s `Set-Cookie` line, CRLF included, at `buf[end.*..]`.
+pub fn renderCookie(cookie: Cookie, buf: []u8, end: *usize) !void {
+    try appendTo(buf, end, "Set-Cookie: ");
+    try appendTo(buf, end, cookie.name);
+    try appendTo(buf, end, "=");
+    try appendTo(buf, end, cookie.value);
+    try appendTo(buf, end, "; ");
+
+    if (cookie.secure) {
+        try appendTo(buf, end, "Secure; ");
+    }
+
+    try appendTo(buf, end, "Path=/; ");
+
+    if (cookie.expires) |expires| {
+        var num_buf: [32]u8 = undefined;
+        const expires_str = try std.fmt.bufPrint(&num_buf, "Max-Age={d}; ", .{expires});
+        try appendTo(buf, end, expires_str);
+    }
+
+    if (cookie.http_only) {
+        try appendTo(buf, end, "HttpOnly; ");
+    }
+
+    if (cookie.same_site) |same_site| {
+        try appendTo(buf, end, "SameSite=");
+        try appendTo(buf, end, same_site.text());
+        try appendTo(buf, end, "; ");
+    }
+
+    // Replace the trailing "; " with the line ending.
+    end.* -= 2;
+    try appendTo(buf, end, "\r\n");
+}
+
+/// The most `renderCookie` writes for `cookie`.
+pub fn cookieCapacity(cookie: Cookie) usize {
+    // "Set-Cookie: ", "=", every attribute and a 20-digit Max-Age, with room.
+    return cookie.name.len + cookie.value.len + 128;
 }
 
 const ctnt = "Content-Length: ";
@@ -1885,6 +1897,20 @@ const BindTarget = struct {
     name: []const u8,
     count: i64,
 };
+
+test "a cookie's SameSite is rendered after its other attributes" {
+    var buf: [256]u8 = undefined;
+    for ([_]struct { Cookie, []const u8 }{
+        .{ .{ .name = "s", .value = "v" }, "Set-Cookie: s=v; Path=/\r\n" },
+        .{ .{ .name = "s", .value = "v", .http_only = true, .same_site = .lax }, "Set-Cookie: s=v; Path=/; HttpOnly; SameSite=Lax\r\n" },
+        .{ .{ .name = "s", .value = "v", .secure = true, .expires = 60, .same_site = .none }, "Set-Cookie: s=v; Secure; Path=/; Max-Age=60; SameSite=None\r\n" },
+    }) |case| {
+        var end: usize = 0;
+        try renderCookie(case[0], &buf, &end);
+        try testing.expectEqualStrings(case[1], buf[0..end]);
+        try testing.expect(end <= cookieCapacity(case[0]));
+    }
+}
 
 test "bind deserialises a JSON json_body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
