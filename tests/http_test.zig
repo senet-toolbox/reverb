@@ -710,3 +710,52 @@ test "responses carry exactly one Connection header" {
         try testing.expectEqual(@as(usize, 1), count);
     }
 }
+
+const Greeting = struct { message: []const u8 };
+
+fn greetJson(ctx: *reverb.Context) !void {
+    try ctx.JSON(Greeting, .{ .message = "x" ** 200 });
+}
+
+// The server's allocator lives as long as the process, so a response body
+// built from it is held until shutdown: a leak per request. All requests go
+// over one keep-alive connection so that per-connection setup, which is
+// not what this is about, is not measured.
+test "JSON responses do not grow the server's memory per request" {
+    var ta: reverb.TrackingAllocator = undefined;
+    const tracked = ta.init(std.heap.page_allocator);
+    defer ta.deinit();
+
+    var h = try Harness.startWith(testing.allocator, &.{.{ .method = .GET, .path = "/json", .handler = greetJson }}, .{
+        .server_allocator = tracked,
+    });
+    defer h.stop();
+    var conn = try h.connect();
+    defer conn.close();
+
+    const request = "GET /json HTTP/1.1\r\nHost: x\r\n\r\n";
+    const exchange = struct {
+        fn run(c: *const harness.Connection) !void {
+            try c.writeAll(request);
+            const response = try c.readResponse(testing.allocator);
+            defer testing.allocator.free(response);
+            try testing.expectEqual(@as(u16, 200), try harness.statusCode(response));
+        }
+    }.run;
+
+    // Warm up, so one-time setup is not counted as growth.
+    for (0..16) |_| try exchange(&conn);
+    const after_warmup = ta.bytesAllocated();
+
+    const iterations: usize = 256;
+    for (0..iterations) |_| try exchange(&conn);
+    const growth = ta.bytesAllocated() -| after_warmup;
+
+    testing.expect(growth < iterations) catch {
+        std.debug.print(
+            "JSON retained {d} bytes across {d} responses ({d} per response)\n",
+            .{ growth, iterations, growth / iterations },
+        );
+        return error.JsonRetainsMemoryPerRequest;
+    };
+}

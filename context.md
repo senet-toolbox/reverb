@@ -31,8 +31,8 @@ See `README.md` for the public API.
 
 ```
 18,763 lines of Zig across 54 files (src/, tests/, examples/)
-      96 test blocks, all of which run
-      93 tests pass (51 unit, 42 integration)
+      97 test blocks, all of which run
+      94 tests pass (51 unit, 43 integration)
 ```
 
 - Deferred responses (§8) are in: `ctx.deferReply`, `reverb.Reply`,
@@ -205,7 +205,7 @@ git history — confirmed.
 ```
 zig build                   # builds
 zig build run               # serves on :8080, SIGTERM to stop
-zig build test              # 93 tests
+zig build test              # 94 tests
 zig build test-unit
 zig build test-integration
 zig build check-readme      # compiles the README examples

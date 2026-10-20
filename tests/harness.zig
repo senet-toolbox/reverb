@@ -25,6 +25,12 @@ pub const Options = struct {
     /// Where deferred replies are allocated. Defaults to the test's own
     /// allocator, so a reply that is never freed fails the test.
     reply_allocator: ?std.mem.Allocator = null,
+    /// The server's long-lived allocator, in place of the arena. An arena
+    /// serves small allocations from chunks it already holds, which hides
+    /// per-request growth from anything measuring what is behind it. The
+    /// server expects an arena and does not free everything at shutdown,
+    /// so this should not be leak-checked.
+    server_allocator: ?std.mem.Allocator = null,
 };
 
 const Server = reverb.Server(Config);
@@ -76,7 +82,7 @@ pub const Harness = struct {
         const server = try allocator.create(Server);
         errdefer allocator.destroy(server);
 
-        try server.new(.{ .reply_timeout_ms = options.reply_timeout_ms }, arena.allocator());
+        try server.new(.{ .reply_timeout_ms = options.reply_timeout_ms }, options.server_allocator orelse arena.allocator());
         errdefer server.deinit();
         server.reply_allocator = options.reply_allocator orelse allocator;
 

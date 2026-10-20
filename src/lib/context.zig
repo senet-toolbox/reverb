@@ -1520,7 +1520,10 @@ pub fn ARRAY(self: *Self, comptime T: type, data: T) !void {
 pub fn JSON(self: *Self, comptime T: type, data: T) !void {
     const fmt = std.json.fmt(data, .{ .whitespace = .indent_2 });
 
-    var writer = std.Io.Writer.Allocating.init(self.arena);
+    // Request memory: `arena` lives as long as the process, so a body built
+    // there was kept for every response. The write copies whatever it
+    // cannot send at once, so nothing reads this after the handler.
+    var writer = std.Io.Writer.Allocating.init(self.requestAllocator());
     try fmt.format(&writer.writer);
 
     const payload = try writer.toOwnedSlice();
