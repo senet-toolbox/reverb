@@ -716,7 +716,7 @@ fn rebuildDateBase(timestamp: u64) void {
     const month_day = year_day.calculateMonthDay();
 
     const year = year_day.year;
-    const month = @intFromEnum(month_day.month); // 0-indexed
+    const month = month_day.month.numeric() - 1;
     const day: u8 = month_day.day_index + 1;
 
     // Day of week: Jan 1 1970 was Thursday (index 3 in Mon=0 scheme)
@@ -1897,6 +1897,15 @@ const BindTarget = struct {
     name: []const u8,
     count: i64,
 };
+
+test "the Date header names the right month and weekday" {
+    // 2026-10-20 is a Tuesday. December is the month that indexed past
+    // the end of the names when the month was taken as 0-based.
+    rebuildDateBase(1792454400 + 3 * 3600);
+    try std.testing.expectEqualStrings("Tue, 20 Oct 2026 00:00:00 GMT", &cached_date);
+    rebuildDateBase(1798675200);
+    try std.testing.expectEqualStrings("Thu, 31 Dec 2026 00:00:00 GMT", &cached_date);
+}
 
 test "a cookie's SameSite is rendered after its other attributes" {
     var buf: [256]u8 = undefined;
