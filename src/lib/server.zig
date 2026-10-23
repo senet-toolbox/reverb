@@ -54,6 +54,12 @@ pub fn Server(comptime Config: type) type {
         context_pool: Abstractions.ManagedMemoryPool(Context),
         context_slots: []*Context,
         request_buffers: []RequestBuffer,
+        /// Where one request is copied out of its request buffer before it
+        /// is served. `MAX_RECV_SIZE` bytes, so it cannot live on the stack:
+        /// the main thread gets 16 MiB, and two such frames overflowed it.
+        /// Shared by every connection -- only the loop thread serves, one
+        /// request at a time.
+        recv_scratch: []u8,
         /// Registered route paths per method, reported by
         /// `/metrics/allroutes`. Allocated from this server's arena, so it
         /// has to live on the instance — see `Metrics.EndPoints`.
@@ -765,6 +771,7 @@ pub fn Server(comptime Config: type) type {
                 .context_pool = Abstractions.ManagedMemoryPool(Context).init(arena),
                 .context_slots = try arena.alloc(*Context, config.max),
                 .request_buffers = try arena.alloc(RequestBuffer, config.max),
+                .recv_scratch = try arena.alloc(u8, MAX_RECV_SIZE),
             };
 
             for (target.request_buffers) |*request_buffer| {
@@ -1053,7 +1060,7 @@ pub fn Server(comptime Config: type) type {
         }
 
         fn handleWebSocket(reverb: *Reverb, client: *Client, recv_data: []const u8) !void {
-            var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
+            const recv_buf = reverb.recv_scratch;
             const ctx = reverb.context_slots[client.slot];
             defer ctx.clear();
             ctx.client = client;
@@ -1097,7 +1104,7 @@ pub fn Server(comptime Config: type) type {
         /// Called after each read, and again once a deferred reply has been
         /// sent, for whatever was pipelined behind it.
         fn serveBuffered(reverb: *Reverb, client: *Client) !void {
-            var recv_buf: [Reverb.MAX_RECV_SIZE]u8 = undefined;
+            const recv_buf = reverb.recv_scratch;
             const request_buffer = &reverb.request_buffers[client.slot];
             const ctx = reverb.context_slots[client.slot];
 
